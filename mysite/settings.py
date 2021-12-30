@@ -83,9 +83,9 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'auto_ops_cmdb',
-        'USER':'root',
-        'PASSWORD':'oneinstack',
-        'HOST':'10.0.0.63',
+        'USER':'这里输入数据库账号',
+        'PASSWORD':'这里输入数据库密码',
+        'HOST':'127.0.0.1',
         'PORT':'3306',
         'OPTIONS':{'isolation_level':None}
     }
