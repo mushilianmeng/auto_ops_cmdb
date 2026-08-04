@@ -83,8 +83,8 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'auto_ops_cmdb',
-        'USER':'这里输入数据库账号',
-        'PASSWORD':'这里输入数据库密码',
+        'USER':'cmdb',
+        'PASSWORD':'cmdb123',
         'HOST':'127.0.0.1',
         'PORT':'3306',
         'OPTIONS':{'isolation_level':None}
