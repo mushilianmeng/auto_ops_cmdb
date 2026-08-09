@@ -1,0 +1,72 @@
+{
+  "status": 0,
+  "data": {
+    "rows": [
+      {
+        "company_name_digest": "digest-001",
+        "company_real_name": "深圳某跨境服饰有限公司",
+        "legal_person": "张三",
+        "company_status": "存续",
+        "establish_date": "2019-05-10",
+        "capital": "100万人民币",
+        "company_address": "广东省深圳市龙岗区坂田街道xxx",
+        "company_phone": "0755-12345678",
+        "company_email": "sales@example.com",
+        "web_site_url": "https://example.com",
+        "business_scope": "一般项目：货物进出口；技术进出口；电子商务；互联网销售；服装服饰零售；箱包销售；仓储服务。"
+      },
+      {
+        "company_name_digest": "digest-002",
+        "company_real_name": "广州某服装进出口有限公司",
+        "legal_person": "李四",
+        "company_status": "存续",
+        "establish_date": "2016-03-01",
+        "capital": "200万人民币",
+        "company_address": "广东省广州市白云区xxx",
+        "company_phone": "020-87654321",
+        "company_email": "",
+        "web_site_url": "",
+        "business_scope": "货物进出口；服装销售；鞋帽零售；日用百货销售。"
+      },
+      {
+        "company_name_digest": "digest-003",
+        "company_real_name": "深圳某国际货运代理有限公司",
+        "legal_person": "王五",
+        "company_status": "存续",
+        "establish_date": "2014-08-20",
+        "capital": "500万人民币",
+        "company_address": "广东省深圳市宝安区xxx",
+        "company_phone": "0755-88886666",
+        "company_email": "ops@forwarder.com",
+        "web_site_url": "",
+        "business_scope": "国际货物运输代理；国内货物运输代理；报关业务；供应链管理；货物进出口。"
+      },
+      {
+        "company_name_digest": "digest-004",
+        "company_real_name": "某商务咨询有限公司",
+        "legal_person": "赵六",
+        "company_status": "存续",
+        "establish_date": "2021-01-01",
+        "capital": "10万人民币",
+        "company_address": "广东省深圳市南山区xxx",
+        "company_phone": "0755-00001111",
+        "company_email": "",
+        "web_site_url": "",
+        "business_scope": "商务信息咨询；企业管理咨询；市场营销策划。"
+      },
+      {
+        "company_name_digest": "digest-002",
+        "company_real_name": "广州某服装进出口有限公司",
+        "legal_person": "李四",
+        "company_status": "存续",
+        "establish_date": "2016-03-01",
+        "capital": "200万人民币",
+        "company_address": "广东省广州市白云区xxx",
+        "company_phone": "020-87654321",
+        "company_email": "",
+        "web_site_url": "",
+        "business_scope": "货物进出口；服装销售；鞋帽零售；日用百货销售。"
+      }
+    ]
+  }
+}
