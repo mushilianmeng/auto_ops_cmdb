@@ -49,6 +49,12 @@ hash_ips() {
     fi
 }
 
+# tc 常把 classid 显示为十六进制（9999 -> 270f, 10 -> a）
+hex_to_dec() {
+    local h="${1,,}"
+    printf '%d' "0x${h}"
+}
+
 # 完全清除（仅 stop 使用）。reload 绝不能走这条路径，
 # 否则删除 DEFAULT_RATE/DEFAULT_CEIL 窗口内总带宽会失控。
 cleanup_tc() {
@@ -56,14 +62,66 @@ cleanup_tc() {
     tc qdisc del dev "$DEV" ingress 2>/dev/null || true
 }
 
+# 是否已有本脚本的 HTB root（handle 1:）
+# 兼容: "qdisc htb 1: root ..." / "qdisc htb 1:0 root ..."
+has_our_htb_root() {
+    tc qdisc show dev "$DEV" 2>/dev/null \
+        | grep -qiE 'qdisc[[:space:]]+htb[[:space:]]+1:([0-9a-fA-F]*)[[:space:]]+root'
+}
+
+# 是否已有任意 root qdisc（含内核默认 fq_codel / pfifo_fast 等）
+has_any_root_qdisc() {
+    tc qdisc show dev "$DEV" 2>/dev/null | grep -qE '[[:space:]]root([[:space:]]|$)'
+}
+
+has_class_minor() {
+    local want_dec="$1"
+    local minor dec
+    while read -r minor; do
+        [[ -z "$minor" ]] && continue
+        dec="$(hex_to_dec "$minor")"
+        if [[ "$dec" -eq "$want_dec" ]]; then
+            return 0
+        fi
+    done < <(tc class show dev "$DEV" 2>/dev/null | awk '
+        tolower($1) == "class" && tolower($2) == "htb" {
+            split($3, a, ":")
+            if (a[1] == "1" && a[2] != "") print a[2]
+        }
+    ')
+    return 1
+}
+
+# HTB 已在时，仅补齐缺失的默认 class，绝不删重建
+ensure_default_classes() {
+    if ! has_class_minor 1; then
+        echo "补齐默认 parent class 1:1（rate=$DEFAULT_CEIL）"
+        tc class add dev "$DEV" parent 1: classid 1:1 htb rate "$DEFAULT_CEIL" ceil "$DEFAULT_CEIL"
+    fi
+    if ! has_class_minor 9999; then
+        echo "补齐默认 class 1:9999（rate=$DEFAULT_RATE ceil=$DEFAULT_CEIL）"
+        tc class add dev "$DEV" parent 1:1 classid 1:9999 htb rate "$DEFAULT_RATE" ceil "$DEFAULT_CEIL"
+        tc qdisc add dev "$DEV" parent 1:9999 handle 9999: sfq perturb 10 2>/dev/null || true
+    fi
+}
+
 # 确保下载侧根 HTB + 默认类存在；已存在则原样保留，不删不重建。
 ensure_download_base() {
-    if tc qdisc show dev "$DEV" 2>/dev/null | grep -qE '^qdisc htb 1:'; then
+    if has_our_htb_root; then
+        ensure_default_classes
         return 0
     fi
 
     echo "初始化下载默认带宽：rate=$DEFAULT_RATE ceil=$DEFAULT_CEIL"
-    tc qdisc add dev "$DEV" root handle 1: htb default 9999
+    # 内核常在 tun0 上预挂 fq_codel/pfifo_fast 等 root，直接 add 会报：
+    #   Error: Exclusivity flag on, cannot modify.
+    # 仅在「本脚本 HTB 尚不存在」时用 replace 完成一次性初始化；
+    # 日常 reload 走上方 has_our_htb_root 分支，不会 replace 已有 HTB。
+    if has_any_root_qdisc; then
+        tc qdisc replace dev "$DEV" root handle 1: htb default 9999
+    else
+        tc qdisc add dev "$DEV" root handle 1: htb default 9999
+    fi
     tc class add dev "$DEV" parent 1: classid 1:1 htb rate "$DEFAULT_CEIL" ceil "$DEFAULT_CEIL"
     tc class add dev "$DEV" parent 1:1 classid 1:9999 htb rate "$DEFAULT_RATE" ceil "$DEFAULT_CEIL"
     tc qdisc add dev "$DEV" parent 1:9999 handle 9999: sfq perturb 10
@@ -71,32 +129,39 @@ ensure_download_base() {
 
 # 确保 ingress qdisc 存在；已存在则保留。
 ensure_upload_base() {
-    if tc qdisc show dev "$DEV" 2>/dev/null | grep -qE '^qdisc ingress ffff:'; then
+    if tc qdisc show dev "$DEV" 2>/dev/null | grep -qiE 'qdisc[[:space:]]+ingress'; then
         return 0
     fi
 
     echo "初始化上传 ingress qdisc"
-    tc qdisc add dev "$DEV" handle ffff: ingress
+    # ingress 同样可能因 exclusivity 失败，失败时忽略（极少数环境用 clsact）
+    if ! tc qdisc add dev "$DEV" handle ffff: ingress 2>/dev/null; then
+        echo "警告: 无法添加 ingress（可能已存在或不受支持），跳过" >&2
+        tc qdisc show dev "$DEV" >&2 || true
+    fi
 }
 
 # 只清客户端下载 class/filter，保留 1: / 1:1 / 1:9999 默认带宽。
 clear_client_download_rules() {
-    local minor
+    local minor dec
 
     # 先删 filter，避免仍指向即将删除的 class
     while tc filter del dev "$DEV" parent 1: protocol ip prio 1 2>/dev/null; do :; done
     while tc filter del dev "$DEV" parent 1: prio 1 2>/dev/null; do :; done
 
-    # 删除非默认 leaf class（保留 1:1 与 1:9999）
+    # 删除非默认 leaf class（保留 1:1 与 1:9999；兼容 hex 显示 1:a / 1:270f）
     while read -r minor; do
         [[ -z "$minor" ]] && continue
-        [[ "$minor" == "1" || "$minor" == "9999" ]] && continue
+        dec="$(hex_to_dec "$minor")"
+        if [[ "$dec" -eq 1 || "$dec" -eq 9999 ]]; then
+            continue
+        fi
         tc qdisc del dev "$DEV" parent "1:${minor}" 2>/dev/null || true
         tc class del dev "$DEV" classid "1:${minor}" 2>/dev/null || true
     done < <(tc class show dev "$DEV" 2>/dev/null | awk '
-        /class htb 1:/ {
+        tolower($1) == "class" && tolower($2) == "htb" {
             split($3, a, ":")
-            if (a[2] != "" && a[2] != "1" && a[2] != "9999") print a[2]
+            if (a[1] == "1" && a[2] != "") print a[2]
         }
     ')
 }
@@ -217,8 +282,9 @@ usage() {
   help           显示帮助
 
 说明:
-  reload 不会执行 tc qdisc del root/ingress，避免 DEFAULT_RATE/DEFAULT_CEIL
-  被删掉重建时出现总带宽突破。若需重建整棵树，请先 stop 再 start。
+  reload 不会删除已存在的 HTB 默认带宽类。
+  若 tun0 上只有内核默认 qdisc（fq_codel 等），首次会用 replace 挂上 HTB。
+  若需整棵树重建，请先 stop 再 start。
 EOF
 }
 
