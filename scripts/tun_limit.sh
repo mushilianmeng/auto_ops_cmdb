@@ -3,18 +3,23 @@ set -euo pipefail
 
 # ===== 配置区 =====
 DEV="tun0"
-RATE="5mbit"
-CEIL="5mbit"
-BURST="64k"
 
+# 每客户端上限（ceil）；rate 必须很小，否则上百客户端时
+# sum(child rate) >> parent rate，HTB 父类总带宽会失效并突破。
+RATE="8kbit"
+CEIL="5mbit"
+BURST="16k"
+
+# 出口总带宽硬顶（class 1:1）
 DEFAULT_RATE="30mbit"
 DEFAULT_CEIL="30mbit"
-# 默认类 burst 宜小，避免短时冲高（nload Max 虚高）
-DEFAULT_BURST="16k"
+DEFAULT_BURST="8k"
+
+# 默认类用 1:2，避免 default 9999 被 tc 当成 0x9999 指空类（走 direct）
+DEFAULT_CLASS_MINOR="2"
 
 STATUS_FILE="/etc/openvpn/openvpn-status.log"
 
-# 状态与锁文件
 STATE_DIR="/var/run/tun-limit"
 HASH_FILE="${STATE_DIR}/last_ips.sha256"
 IPS_FILE="${STATE_DIR}/last_ips.txt"
@@ -22,7 +27,6 @@ LOCK_FILE="/var/run/tun_limit.lock"
 
 mkdir -p "$STATE_DIR"
 
-# 防并发：避免 cron 重叠执行
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     echo "已有实例在运行，跳过本次执行。"
@@ -51,28 +55,17 @@ hash_ips() {
     fi
 }
 
-# tc 可能把 minor 显示成十进制（9999）或十六进制（270f）
-# 注意：不能把 "9999" 当十六进制解析（0x9999=39321）
 minor_equals() {
     local shown="${1,,}"
     local want_dec="$2"
     local want_hex
     want_hex="$(printf '%x' "$want_dec")"
-
-    # 十进制原文
-    if [[ "$shown" == "$want_dec" ]]; then
-        return 0
-    fi
-    # 十六进制原文（无 0x 前缀）
-    if [[ "$shown" == "$want_hex" ]]; then
-        return 0
-    fi
-    return 1
+    [[ "$shown" == "$want_dec" || "$shown" == "$want_hex" ]]
 }
 
 is_preserved_minor() {
     local shown="$1"
-    minor_equals "$shown" 1 || minor_equals "$shown" 9999
+    minor_equals "$shown" 1 || minor_equals "$shown" "$DEFAULT_CLASS_MINOR" || minor_equals "$shown" 9999
 }
 
 list_htb_minors() {
@@ -96,53 +89,105 @@ has_class_minor() {
     return 1
 }
 
-# 完全清除（仅 stop 使用）。reload 绝不能走这条路径，
-# 否则删除 DEFAULT_RATE/DEFAULT_CEIL 窗口内总带宽会失控。
 cleanup_tc() {
     tc qdisc del dev "$DEV" root 2>/dev/null || true
     tc qdisc del dev "$DEV" ingress 2>/dev/null || true
 }
 
-# 是否已有本脚本的 HTB root（handle 1:）
+# 读取 HTB default 的原始 minor 字符串（去掉 0x）。
+# 例: default 0x9999 -> 9999（创建/change 时用 classid 1:9999）
+get_htb_default_raw() {
+    tc qdisc show dev "$DEV" 2>/dev/null | awk '
+        tolower($2) == "htb" {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "default") {
+                    raw = $(i + 1)
+                    gsub(/^0[xX]/, "", raw)
+                    print raw
+                    exit
+                }
+            }
+        }
+    '
+}
+
+# 只要 tun0 上已有 HTB root 就视为已初始化（勿再 qdisc replace）
 has_our_htb_root() {
-    tc qdisc show dev "$DEV" 2>/dev/null \
-        | grep -qiE 'qdisc[[:space:]]+htb[[:space:]]+1:([0-9a-fA-F]*)[[:space:]]+root'
+    tc qdisc show dev "$DEV" 2>/dev/null | grep -qi 'qdisc htb'
 }
 
 has_any_root_qdisc() {
     tc qdisc show dev "$DEV" 2>/dev/null | grep -qE '[[:space:]]root([[:space:]]|$)'
 }
 
-# 原地 add/change 默认类速率，绝不 del（避免总带宽空窗）
+class_change_or_add() {
+    local parent="$1"
+    local classid="$2"
+    local rate="$3"
+    local ceil="$4"
+    local burst="$5"
+
+    if tc class change dev "$DEV" parent "$parent" classid "$classid" htb \
+        rate "$rate" ceil "$ceil" burst "$burst" cburst "$burst" quantum 1500 2>/dev/null; then
+        return 0
+    fi
+    if tc class add dev "$DEV" parent "$parent" classid "$classid" htb \
+        rate "$rate" ceil "$ceil" burst "$burst" cburst "$burst" quantum 1500 2>/dev/null; then
+        return 0
+    fi
+    # 最后再试一次 change（add 因 File exists 失败时）
+    tc class change dev "$DEV" parent "$parent" classid "$classid" htb \
+        rate "$rate" ceil "$ceil" burst "$burst" cburst "$burst" quantum 1500
+}
+
+# 原地同步总带宽；绝不 qdisc del/replace（避免空窗突破）
 ensure_default_classes() {
-    echo "同步默认带宽：parent/default = $DEFAULT_RATE/$DEFAULT_CEIL（原地 change，不删除）"
+    local def_raw
+    def_raw="$(get_htb_default_raw || true)"
+    [[ -n "$def_raw" ]] || def_raw="$DEFAULT_CLASS_MINOR"
 
-    if has_class_minor 1; then
-        tc class change dev "$DEV" parent 1: classid 1:1 htb \
-            rate "$DEFAULT_CEIL" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST"
-    else
-        tc class add dev "$DEV" parent 1: classid 1:1 htb \
-            rate "$DEFAULT_CEIL" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST"
+    echo "同步总带宽硬顶：$DEFAULT_CEIL（原地 class change，不删除 qdisc）"
+    echo "当前 HTB default -> classid 1:${def_raw}"
+
+    # 父类 1:1：总出口硬顶
+    class_change_or_add "1:" "1:1" "$DEFAULT_CEIL" "$DEFAULT_CEIL" "$DEFAULT_BURST"
+
+    # 改 HTB 正在使用的 default class（现网是 1:9999 / default 0x9999）
+    if [[ "$def_raw" != "1" ]]; then
+        class_change_or_add "1:1" "1:${def_raw}" "$DEFAULT_RATE" "$DEFAULT_CEIL" "$DEFAULT_BURST"
+        tc qdisc add dev "$DEV" parent "1:${def_raw}" handle "${def_raw}:" sfq perturb 10 2>/dev/null || true
     fi
 
+    # 兼容：显式再压一次常见默认类
     if has_class_minor 9999; then
-        tc class change dev "$DEV" parent 1:1 classid 1:9999 htb \
-            rate "$DEFAULT_RATE" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST"
-    else
-        # 已存在时 add 会 File exists；兼容检测边界情况
-        if ! tc class add dev "$DEV" parent 1:1 classid 1:9999 htb \
-            rate "$DEFAULT_RATE" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST" 2>/dev/null; then
-            tc class change dev "$DEV" parent 1:1 classid 1:9999 htb \
-                rate "$DEFAULT_RATE" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST"
-        fi
-        tc qdisc add dev "$DEV" parent 1:9999 handle 9999: sfq perturb 10 2>/dev/null || true
+        class_change_or_add "1:1" "1:9999" "$DEFAULT_RATE" "$DEFAULT_CEIL" "$DEFAULT_BURST"
+    fi
+    if [[ "$def_raw" != "$DEFAULT_CLASS_MINOR" ]]; then
+        class_change_or_add "1:1" "1:${DEFAULT_CLASS_MINOR}" "$DEFAULT_RATE" "$DEFAULT_CEIL" "$DEFAULT_BURST"
+        tc qdisc add dev "$DEV" parent "1:${DEFAULT_CLASS_MINOR}" handle "${DEFAULT_CLASS_MINOR}:" sfq perturb 10 2>/dev/null || true
     fi
 
-    # 确认默认类仍在：若被误删，未分类流量会走 direct，总带宽会失控
-    if ! has_class_minor 1 || ! has_class_minor 9999; then
-        echo "错误: 默认 class 1:1 / 1:9999 不完整，当前 class 如下：" >&2
+    if ! has_class_minor 1; then
+        echo "错误: class 1:1 不存在" >&2
         tc class show dev "$DEV" >&2 || true
         return 1
+    fi
+
+    # 打印关键 class，便于确认已从 40Mbit 降到 30Mbit
+    tc class show dev "$DEV" | awk '
+        /class htb 1:1 / || /class htb 1:2 / || /class htb 1:9999 / {print}
+    ' || true
+
+    local direct
+    direct="$(tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
+        /qdisc htb/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "direct_packets_stat") { print $(i + 1); exit }
+            }
+        }
+    ')"
+    if [[ -n "${direct:-}" && "$direct" =~ ^[0-9]+$ && "$direct" -gt 1000 ]]; then
+        echo "警告: direct_packets_stat=$direct 较高，部分流量可能未进入 HTB class" >&2
     fi
 }
 
@@ -152,33 +197,29 @@ ensure_download_base() {
         return 0
     fi
 
-    echo "初始化下载默认带宽：rate=$DEFAULT_RATE ceil=$DEFAULT_CEIL"
-    # 内核常预挂 fq_codel 等，add 会报 Exclusivity；仅首次用 replace
+    echo "初始化下载 HTB：总带宽 $DEFAULT_CEIL，default class 1:${DEFAULT_CLASS_MINOR}"
     if has_any_root_qdisc; then
-        tc qdisc replace dev "$DEV" root handle 1: htb default 9999
+        # 仅首次：替换 fq_codel 等；已有 HTB 时禁止走到这里
+        tc qdisc replace dev "$DEV" root handle 1: htb default "$DEFAULT_CLASS_MINOR"
     else
-        tc qdisc add dev "$DEV" root handle 1: htb default 9999
+        tc qdisc add dev "$DEV" root handle 1: htb default "$DEFAULT_CLASS_MINOR"
     fi
     tc class add dev "$DEV" parent 1: classid 1:1 htb \
-        rate "$DEFAULT_CEIL" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST"
-    tc class add dev "$DEV" parent 1:1 classid 1:9999 htb \
-        rate "$DEFAULT_RATE" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST"
-    tc qdisc add dev "$DEV" parent 1:9999 handle 9999: sfq perturb 10
+        rate "$DEFAULT_CEIL" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST" quantum 1500
+    tc class add dev "$DEV" parent 1:1 classid "1:${DEFAULT_CLASS_MINOR}" htb \
+        rate "$DEFAULT_RATE" ceil "$DEFAULT_CEIL" burst "$DEFAULT_BURST" cburst "$DEFAULT_BURST" quantum 1500
+    tc qdisc add dev "$DEV" parent "1:${DEFAULT_CLASS_MINOR}" handle "${DEFAULT_CLASS_MINOR}:" sfq perturb 10
 }
 
 ensure_upload_base() {
     if tc qdisc show dev "$DEV" 2>/dev/null | grep -qiE 'qdisc[[:space:]]+ingress'; then
         return 0
     fi
-
     echo "初始化上传 ingress qdisc"
-    if ! tc qdisc add dev "$DEV" handle ffff: ingress 2>/dev/null; then
-        echo "警告: 无法添加 ingress（可能已存在或不受支持），跳过" >&2
-        tc qdisc show dev "$DEV" >&2 || true
-    fi
+    tc qdisc add dev "$DEV" handle ffff: ingress 2>/dev/null || \
+        echo "警告: 无法添加 ingress" >&2
 }
 
-# 只清客户端下载 class/filter，保留 1:1 / 1:9999
 clear_client_download_rules() {
     local minor
 
@@ -194,11 +235,8 @@ clear_client_download_rules() {
         tc class del dev "$DEV" classid "1:${minor}" 2>/dev/null || true
     done < <(list_htb_minors)
 
-    # 清完客户端后再次确认默认类仍在
-    if ! has_class_minor 1 || ! has_class_minor 9999; then
-        echo "警告: 清理客户端后默认类缺失，正在补回..." >&2
-        ensure_default_classes
-    fi
+    # 清理后再次压一次总带宽，防止误伤
+    ensure_default_classes
 }
 
 clear_client_upload_rules() {
@@ -211,13 +249,13 @@ setup_client_download_limits() {
     local class_minor=10
     local count=0
 
-    echo "配置下载限速（服务端 -> 客户端）..."
+    echo "配置下载限速：每 IP ceil=$CEIL（rate=$RATE，避免子类 rate 之和撑破父类）..."
 
     if [[ -n "$ips" ]]; then
         while IFS= read -r ip; do
             [[ -z "$ip" ]] && continue
             tc class add dev "$DEV" parent 1:1 classid 1:"$class_minor" htb \
-                rate "$RATE" ceil "$CEIL" burst "$BURST"
+                rate "$RATE" ceil "$CEIL" burst "$BURST" cburst "$BURST" quantum 1500
             tc qdisc add dev "$DEV" parent 1:"$class_minor" handle "${class_minor}0": sfq perturb 10
             tc filter add dev "$DEV" parent 1: protocol ip prio 1 u32 \
                 match ip dst "$ip"/32 flowid 1:"$class_minor"
@@ -226,26 +264,26 @@ setup_client_download_limits() {
         done <<< "$ips"
     fi
 
-    echo "下载限速完成：$count 个IP，每个 $RATE（默认类未删除）"
+    echo "下载限速完成：$count 个IP"
 }
 
 setup_client_upload_limits() {
     local ips="${1-}"
     local count=0
 
-    echo "配置上传限速（客户端 -> 服务端）..."
+    echo "配置上传限速（police $CEIL）..."
 
     if [[ -n "$ips" ]]; then
         while IFS= read -r ip; do
             [[ -z "$ip" ]] && continue
             tc filter add dev "$DEV" parent ffff: protocol ip prio 1 u32 \
                 match ip src "$ip"/32 \
-                police rate "$RATE" burst "$BURST" drop flowid :1
+                police rate "$CEIL" burst "$BURST" drop flowid :1
             count=$((count + 1))
         done <<< "$ips"
     fi
 
-    echo "上传限速完成：$count 个IP，每个 $RATE（ingress 未重建）"
+    echo "上传限速完成：$count 个IP"
 }
 
 apply_limits() {
@@ -256,6 +294,10 @@ apply_limits() {
     clear_client_upload_rules
     setup_client_download_limits "$ips"
     setup_client_upload_limits "$ips"
+    echo "--- 校验 ---"
+    tc class show dev "$DEV" | awk '
+        /class htb 1:1 / || /class htb 1:2 / || /class htb 1:9999 / {print}
+    ' || true
 }
 
 reload_if_needed() {
@@ -270,14 +312,13 @@ reload_if_needed() {
     fi
 
     if [[ "$force" != "1" && "$new_hash" == "$old_hash" ]]; then
-        # IP 未变也同步默认速率，并确保默认类在
         ensure_download_base
         ensure_upload_base
-        echo "在线IP集合未变化，已同步默认带宽，跳过客户端规则重载。"
+        echo "在线IP集合未变化，已同步总带宽 $DEFAULT_CEIL。"
         exit 0
     fi
 
-    echo "检测到IP集合变化，刷新客户端限速（保留并同步默认 $DEFAULT_RATE/$DEFAULT_CEIL）..."
+    echo "刷新客户端限速（总带宽原地同步为 $DEFAULT_CEIL，不删 HTB root）..."
     apply_limits "$ips"
 
     printf '%s\n' "$new_hash" > "$HASH_FILE"
@@ -290,34 +331,35 @@ reload_if_needed() {
 
 show_status() {
     echo "=== qdisc ==="
-    tc qdisc show dev "$DEV" || true
+    tc -s qdisc show dev "$DEV" | head -n 20 || true
     echo
-    echo "=== class ==="
-    tc class show dev "$DEV" || true
+    echo "=== class (parent/default) ==="
+    tc class show dev "$DEV" | awk '
+        /class htb 1:1 / || /class htb 1:2 / || /class htb 1:9999 / {print}
+    ' || true
     echo
-    echo "=== filter(root 1:) ==="
-    tc filter show dev "$DEV" parent 1: || true
+    echo "=== class count ==="
+    tc class show dev "$DEV" 2>/dev/null | grep -c 'class htb' || true
     echo
-    echo "=== filter(ingress ffff:) ==="
-    tc filter show dev "$DEV" parent ffff: || true
+    echo "=== filter count (egress) ==="
+    tc filter show dev "$DEV" parent 1: 2>/dev/null | grep -c 'flowid' || true
     echo
-    echo "=== last ips ==="
-    [[ -f "$IPS_FILE" ]] && cat "$IPS_FILE" || echo "(empty)"
+    echo "=== last ips (count) ==="
+    if [[ -f "$IPS_FILE" ]]; then
+        wc -l < "$IPS_FILE"
+    else
+        echo 0
+    fi
 }
 
 usage() {
     cat <<EOF
 用法: $0 {start|reload|force-reload|stop|status|ips|help}
-  start/reload   IP 变化时刷新客户端限速；默认带宽原地 change，不删除
-  force-reload   强制刷新客户端限速（仍保留并同步 DEFAULT_*）
-  stop           清除所有限速规则（含默认带宽）
-  status         查看当前tc状态
-  ips            查看当前在线IP
-  help           显示帮助
 
-说明:
-  默认总带宽由 class 1:1 / 1:9999 控制，reload 只用 change 同步速率，
-  避免 del/add 空窗导致总带宽突破。
+关键点:
+  - 总带宽由 class 1:1 ceil=$DEFAULT_CEIL 控制；reload 只用 class change，不删 root
+  - 每客户端 rate=$RATE ceil=$CEIL（rate 必须小，否则上百客户端会撑破父类）
+  - 若 status 里 1:1 仍是 40Mbit，说明旧脚本未更新成功
 EOF
 }
 
