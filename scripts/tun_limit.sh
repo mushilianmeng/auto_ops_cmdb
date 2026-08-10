@@ -149,12 +149,26 @@ has_class_minor() {
 
 has_htb_root() {
     local dev="$1"
-    tc qdisc show dev "$dev" 2>/dev/null | grep -qi 'qdisc htb'
+    local out
+    out="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
+    [[ "$out" == *htb* || "$out" == *HTB* ]]
+}
+
+# 是否已有本脚本的限速树：HTB root 或 class 1:1 任一存在即视为已初始化
+# （禁止再 qdisc replace/del root，否则会报 Change not supported 或打穿总顶）
+has_our_shaper() {
+    local dev="$1"
+    if has_htb_root "$dev"; then
+        return 0
+    fi
+    has_class_minor "$dev" 1
 }
 
 has_any_root() {
     local dev="$1"
-    tc qdisc show dev "$dev" 2>/dev/null | grep -qE '[[:space:]]root([[:space:]]|$)'
+    local out
+    out="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
+    [[ "$out" == *" root "* || "$out" == *" root" ]]
 }
 
 get_htb_default_raw() {
@@ -183,8 +197,12 @@ class_change_or_add() {
         rate "$rate" ceil "$ceil" burst "$burst" cburst "$burst" quantum 1500 2>/dev/null; then
         return 0
     fi
-    tc class change dev "$dev" parent "$parent" classid "$classid" htb \
-        rate "$rate" ceil "$ceil" burst "$burst" cburst "$burst" quantum 1500
+    if tc class change dev "$dev" parent "$parent" classid "$classid" htb \
+        rate "$rate" ceil "$ceil" burst "$burst" cburst "$burst" quantum 1500 2>/dev/null; then
+        return 0
+    fi
+    echo "警告: 无法设置 $dev $classid -> rate=$rate ceil=$ceil" >&2
+    return 1
 }
 
 # 确认 class 行里的 rate/ceil 数值（Mbit）不超过期望 mbit
@@ -206,48 +224,83 @@ class_rate_ceil_ok() {
 
 ensure_total_cap() {
     local dev="$1"
+    local quiet="${2:-0}"
     local def_raw
     def_raw="$(get_htb_default_raw "$dev" || true)"
     [[ -n "$def_raw" ]] || def_raw="$DEFAULT_CLASS_MINOR"
 
-    echo "[$dev] 同步总带宽硬顶 ${TOTAL_CEIL}（class change，不删 qdisc） default=1:${def_raw}"
+    if [[ "$quiet" != "1" ]]; then
+        echo "[$dev] 同步总带宽硬顶 ${TOTAL_CEIL}（class change，不删 qdisc） default=1:${def_raw}"
+    fi
 
-    # 父类：总带宽硬顶
-    class_change_or_add "$dev" "1:" "1:1" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST"
+    # 父类：总带宽硬顶（必须成功）
+    if ! class_change_or_add "$dev" "1:" "1:1" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST"; then
+        echo "[$dev] 错误: 无法设置总顶 class 1:1" >&2
+        return 1
+    fi
 
     # HTB default 指向的类
     if [[ "$def_raw" != "1" ]]; then
-        class_change_or_add "$dev" "1:1" "1:${def_raw}" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST"
+        class_change_or_add "$dev" "1:1" "1:${def_raw}" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST" || true
         tc qdisc add dev "$dev" parent "1:${def_raw}" handle "${def_raw}:" sfq perturb 10 2>/dev/null || true
     fi
 
     # 兼容旧 1:9999 / 新 1:2
     if has_class_minor "$dev" 9999; then
-        class_change_or_add "$dev" "1:1" "1:9999" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST"
+        class_change_or_add "$dev" "1:1" "1:9999" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST" || true
     fi
     if [[ "$def_raw" != "$DEFAULT_CLASS_MINOR" ]]; then
-        class_change_or_add "$dev" "1:1" "1:${DEFAULT_CLASS_MINOR}" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST"
+        class_change_or_add "$dev" "1:1" "1:${DEFAULT_CLASS_MINOR}" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST" || true
         tc qdisc add dev "$dev" parent "1:${DEFAULT_CLASS_MINOR}" handle "${DEFAULT_CLASS_MINOR}:" sfq perturb 10 2>/dev/null || true
     fi
 }
 
+# 仅在「完全没有我们的限速树」时创建；已有 HTB/1:1 时绝不 replace/del root
 init_htb_tree() {
     local dev="$1"
-    echo "[$dev] 初始化 HTB：总顶 ${TOTAL_CEIL}，default 1:${DEFAULT_CLASS_MINOR}"
-    if has_any_root "$dev"; then
-        tc qdisc replace dev "$dev" root handle 1: htb default "$DEFAULT_CLASS_MINOR"
-    else
-        tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_CLASS_MINOR"
+
+    if has_our_shaper "$dev"; then
+        ensure_total_cap "$dev"
+        return 0
     fi
+
+    echo "[$dev] 初始化 HTB：总顶 ${TOTAL_CEIL}，default 1:${DEFAULT_CLASS_MINOR}"
+
+    # 非 HTB root（如 fq_codel）：del + add。绝不用 replace（对已有 HTB 会报
+    # Error: Change operation not supported by specified qdisc）
+    if has_any_root "$dev"; then
+        if has_htb_root "$dev"; then
+            ensure_total_cap "$dev"
+            return 0
+        fi
+        tc qdisc del dev "$dev" root 2>/dev/null || true
+    fi
+
+    if ! tc qdisc add dev "$dev" root handle 1: htb default "$DEFAULT_CLASS_MINOR" 2>/dev/null; then
+        # 竞态：别人已建好，或检测漏判
+        if has_our_shaper "$dev"; then
+            echo "[$dev] root 已存在，改为同步总顶（跳过初始化）"
+            ensure_total_cap "$dev"
+            return 0
+        fi
+        echo "[$dev] 错误: 无法创建 HTB。当前 qdisc:" >&2
+        tc qdisc show dev "$dev" >&2 || true
+        return 1
+    fi
+
     tc class add dev "$dev" parent 1: classid 1:1 htb \
-        rate "$TOTAL_RATE" ceil "$TOTAL_CEIL" burst "$TOTAL_BURST" cburst "$TOTAL_BURST" quantum 1500
+        rate "$TOTAL_RATE" ceil "$TOTAL_CEIL" burst "$TOTAL_BURST" cburst "$TOTAL_BURST" quantum 1500 2>/dev/null \
+        || class_change_or_add "$dev" "1:" "1:1" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST"
+
     tc class add dev "$dev" parent 1:1 classid "1:${DEFAULT_CLASS_MINOR}" htb \
-        rate "$TOTAL_RATE" ceil "$TOTAL_CEIL" burst "$TOTAL_BURST" cburst "$TOTAL_BURST" quantum 1500
-    tc qdisc add dev "$dev" parent "1:${DEFAULT_CLASS_MINOR}" handle "${DEFAULT_CLASS_MINOR}:" sfq perturb 10
+        rate "$TOTAL_RATE" ceil "$TOTAL_CEIL" burst "$TOTAL_BURST" cburst "$TOTAL_BURST" quantum 1500 2>/dev/null \
+        || class_change_or_add "$dev" "1:1" "1:${DEFAULT_CLASS_MINOR}" "$TOTAL_RATE" "$TOTAL_CEIL" "$TOTAL_BURST"
+
+    tc qdisc add dev "$dev" parent "1:${DEFAULT_CLASS_MINOR}" handle "${DEFAULT_CLASS_MINOR}:" sfq perturb 10 2>/dev/null || true
 }
 
 ensure_download_base() {
-    if has_htb_root "$DEV"; then
+    if has_our_shaper "$DEV"; then
         ensure_total_cap "$DEV"
     else
         init_htb_tree "$DEV"
@@ -270,7 +323,8 @@ clear_client_classes_filters() {
         tc class del dev "$dev" classid "1:${minor}" 2>/dev/null || true
     done < <(list_htb_minors "$dev")
 
-    ensure_total_cap "$dev"
+    # 清客户端后静默再压一次总顶，防止误伤默认类
+    ensure_total_cap "$dev" 1
 }
 
 setup_client_download() {
@@ -327,11 +381,10 @@ setup_client_upload_ifb() {
     n="$(count_lines "$ips")"
     per_kbit="$(calc_ip_rate_kbit "$n")"
 
-    if has_htb_root "$IFB_DEV"; then
+    # 已有限速树则只同步总顶；绝不 del/replace ifb root
+    if has_our_shaper "$IFB_DEV"; then
         ensure_total_cap "$IFB_DEV"
     else
-        # ifb 可安全 replace（不影响 tun0 总顶空窗；上传侧重建可接受）
-        tc qdisc del dev "$IFB_DEV" root 2>/dev/null || true
         init_htb_tree "$IFB_DEV"
     fi
 
@@ -415,7 +468,7 @@ verify_caps() {
         fi
     fi
 
-    if has_htb_root "$IFB_DEV" 2>/dev/null; then
+    if has_our_shaper "$IFB_DEV"; then
         line="$(tc class show dev "$IFB_DEV" 2>/dev/null | awk '/class htb 1:1 /{print; exit}')"
         if [[ -n "$line" ]] && class_rate_ceil_ok "$line" "$TOTAL_CEIL"; then
             echo "OK  上传总顶: $line"
@@ -425,7 +478,10 @@ verify_caps() {
         fi
     fi
 
-    (( ok == 1 ))
+    if [[ "$ok" -eq 1 ]]; then
+        return 0
+    fi
+    return 1
 }
 
 # ---------- 主流程 ----------
@@ -449,9 +505,14 @@ apply_limits() {
 
     # 最后再压一次总顶，防止清理过程中被干扰
     ensure_total_cap "$DEV"
-    has_htb_root "$IFB_DEV" 2>/dev/null && ensure_total_cap "$IFB_DEV"
+    if has_our_shaper "$IFB_DEV"; then
+        ensure_total_cap "$IFB_DEV"
+    fi
 
-    verify_caps
+    if ! verify_caps; then
+        echo "错误: 限速校验失败，请执行 $0 status 检查" >&2
+        return 1
+    fi
 }
 
 reload_if_needed() {
@@ -464,7 +525,9 @@ reload_if_needed() {
 
     if [[ "$force" != "1" && "$new_hash" == "$old_hash" ]]; then
         ensure_download_base
-        has_htb_root "$IFB_DEV" 2>/dev/null && ensure_total_cap "$IFB_DEV"
+        if has_our_shaper "$IFB_DEV"; then
+            ensure_total_cap "$IFB_DEV"
+        fi
         verify_caps || true
         echo "在线IP集合未变化，已同步总顶 ${TOTAL_CEIL}。"
         exit 0
