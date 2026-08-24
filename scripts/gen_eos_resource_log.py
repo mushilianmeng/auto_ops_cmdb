@@ -100,7 +100,8 @@ def fmt_tb(gb):
 
 
 def fmt_pb(gb):
-    return "%.2f" % (float(gb) / 1024.0 / 1024.0)
+    # 业务口径: 1024GB=1TB, 1000TB=1PB（3072000GB -> 3000TB -> 3PB）
+    return "%.2f" % (float(gb) / 1024.0 / 1000.0)
 
 
 def lerp(a, b, t):
@@ -141,11 +142,13 @@ def build_billing_cycles(order_start, months):
 class ResourceState(object):
     """按「当前账期（一个月）」计算当月额度总量/已用（60%~80%）"""
 
-    def __init__(self, cycles, usage_start, usage_end, seed):
+    def __init__(self, cycles, usage_start, usage_end, seed, order_start, final_expire):
         self.cycles = cycles
         self.usage_start = usage_start
         self.usage_end = usage_end
         self.seed = seed
+        self.order_start = order_start
+        self.final_expire = final_expire
         self._i = 0
 
     def _r(self):
@@ -217,8 +220,9 @@ class ResourceState(object):
         allocated = 0.0
         lo = each * self.usage_start
         hi = each * self.usage_end
-        active = cycle["start"].strftime("%Y-%m-%d %H:%M:%S")
-        expire = cycle["end"].strftime("%Y-%m-%d %H:%M:%S")
+        # 控制台口径：生效=订购时间，到期=自动续订最终到期 2026-04-04
+        active = self.order_start.strftime("%Y-%m-%d %H:%M:%S")
+        expire = self.final_expire.strftime("%Y-%m-%d %H:%M:%S")
         for i in range(n):
             if i == n - 1:
                 used = clamp(total_used - allocated, 0.0, each)
@@ -236,7 +240,7 @@ class ResourceState(object):
                 "expire": expire,
                 "region": REGION_CN,
                 "cycle": cycle["label"],
-                "validity": "1个月",
+                "validity": "1个月(自动续订)",
                 "auto_renew": "是" if cycle["auto_renew"] else "否(末期)",
             })
         drift = total_used - sum(p["used"] for p in pkgs)
@@ -265,7 +269,8 @@ class LogBuilder(object):
         self.order_start = order_start
         self.final_expire = final_expire
         self.cycles = build_billing_cycles(order_start, PROJECT_MONTHS)
-        self.state = ResourceState(self.cycles, usage_start, usage_end, seed)
+        self.state = ResourceState(
+            self.cycles, usage_start, usage_end, seed, order_start, final_expire)
         self.lines = []
         self.i = 0
         self.objects = 0
@@ -538,7 +543,7 @@ class LogBuilder(object):
                         fmt_gb(snap["cap_total"]), fmt_gb(snap["cap_used"]),
                         fmt_gb(snap["traf_total"]), fmt_gb(snap["traf_used"]),
                         snap["ratio"] * 100,
-                        ts(snap["cycle"]["end"]),
+                        ts(self.final_expire),
                         ts(self.final_expire),
                     ))
 
