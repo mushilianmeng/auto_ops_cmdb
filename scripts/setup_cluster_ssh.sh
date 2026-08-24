@@ -177,11 +177,14 @@ can_pubkey() {
     "${SSH_USER}@${ip}" true >/dev/null 2>&1
 }
 
-ssh_exec() {
+# ssh 会把参数拼成一条命令交给远端 shell；必须先 %q，否则 # 会被当成注释。
+ssh_remote() {
   local ip="$1"
   shift
+  local remote
+  remote=$(printf '%q ' "$@")
   if can_pubkey "$ip"; then
-    ssh "${SSH_BASE_OPTS[@]}" "${SSH_USER}@${ip}" "$@"
+    ssh "${SSH_BASE_OPTS[@]}" "${SSH_USER}@${ip}" "$remote"
     return
   fi
   ensure_password
@@ -189,7 +192,11 @@ ssh_exec() {
   sshpass -e ssh "${SSH_BASE_OPTS[@]}" \
     -o PreferredAuthentications=password,keyboard-interactive \
     -o PubkeyAuthentication=no \
-    "${SSH_USER}@${ip}" "$@"
+    "${SSH_USER}@${ip}" "$remote"
+}
+
+ssh_exec() {
+  ssh_remote "$@"
 }
 
 scp_put() {
@@ -279,18 +286,31 @@ if [[ $SYNC_HOSTS -eq 1 ]]; then
   fi
 fi
 
-log "探测各节点主机密钥（ssh-keyscan）"
-for i in "${!NODE_HOSTS[@]}"; do
-  ip="${NODE_IPS[$i]}"
-  host="${NODE_HOSTS[$i]}"
-  ssh-keyscan -T 5 -t rsa,ecdsa,ed25519 "$ip" 2>/dev/null | sed "s/^$ip /$host /" >>"$KNOWN" || true
-  ssh-keyscan -T 5 -t rsa,ecdsa,ed25519 "$ip" 2>/dev/null >>"$KNOWN" || true
-  if command -v getent >/dev/null 2>&1 && getent hosts "$host" >/dev/null 2>&1; then
-    ssh-keyscan -T 5 -t rsa,ecdsa,ed25519 "$host" 2>/dev/null >>"$KNOWN" || true
+scan_node_keys() {
+  local ip="$1" host="$2" outfile="$3"
+  local tmp
+  tmp="$(mktemp)"
+  ssh-keyscan -T 8 "$ip" 2>/dev/null | grep -v '^#' >"$tmp" || true
+  if [[ ! -s "$tmp" ]]; then
+    ssh-keyscan -T 8 -t rsa,ecdsa,ed25519 "$ip" 2>/dev/null | grep -v '^#' >"$tmp" || true
   fi
+  if [[ -s "$tmp" ]]; then
+    awk -v ip="$ip" -v host="$host" 'NF >= 3 {
+      key=$2; blob=$3
+      print ip, key, blob
+      print host, key, blob
+      print host "," ip, key, blob
+    }' "$tmp" >>"$outfile"
+  fi
+  rm -f "$tmp"
+}
+
+log "探测各节点主机密钥（ssh-keyscan，含 ed25519）"
+for i in "${!NODE_HOSTS[@]}"; do
+  scan_node_keys "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}" "$KNOWN"
 done
 if [[ ! -s "$KNOWN" ]]; then
-  warn "ssh-keyscan 没有拿到任何主机密钥，首次互访可能会询问 known_hosts"
+  warn "ssh-keyscan 没有拿到任何主机密钥，将依赖 StrictHostKeyChecking=no"
 else
   sort -u "$KNOWN" -o "$KNOWN"
 fi
@@ -340,13 +360,18 @@ SSH_CONFIG_SNIPPET="$WORK_DIR/ssh_config_cluster"
 {
   printf '%s\n' "$MARKER_BEGIN"
   printf 'Host'
-  for host in "${NODE_HOSTS[@]}"; do
-    printf ' %s' "$host"
+  for i in "${!NODE_HOSTS[@]}"; do
+    printf ' %s %s' "${NODE_HOSTS[$i]}" "${NODE_IPS[$i]}"
   done
   printf '\n'
   printf '    User %s\n' "$SSH_USER"
   cat <<'CFG'
     StrictHostKeyChecking no
+    UserKnownHostsFile ~/.ssh/known_hosts
+    HashKnownHosts no
+    IgnoreUnknown UpdateHostKeys
+    UpdateHostKeys no
+    LogLevel ERROR
     IdentityFile ~/.ssh/id_ed25519
     IdentityFile ~/.ssh/id_rsa
 CFG
@@ -355,6 +380,14 @@ CFG
 
 HOSTS_BLOCK_FILE="$WORK_DIR/hosts.block"
 cluster_hosts_block >"$HOSTS_BLOCK_FILE"
+
+INSTALL_TAG="$$"
+KEYSCAN_TARGETS="$WORK_DIR/keyscan.targets"
+{
+  for i in "${!NODE_HOSTS[@]}"; do
+    printf '%s\n' "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}"
+  done
+} >"$KEYSCAN_TARGETS"
 
 merge_marker_file() {
   local src="$1" dest="$2"
@@ -366,6 +399,15 @@ merge_marker_file() {
     ' "$dest"
   fi
   cat "$src"
+}
+
+refresh_local_known_hosts() {
+  local i
+  for i in "${!NODE_HOSTS[@]}"; do
+    scan_node_keys "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}" "$HOME/.ssh/known_hosts"
+  done
+  sort -u "$HOME/.ssh/known_hosts" -o "$HOME/.ssh/known_hosts"
+  chmod 600 "$HOME/.ssh/known_hosts"
 }
 
 apply_trust_local() {
@@ -396,72 +438,83 @@ apply_trust_local() {
       warn "本机不是 root，跳过写入 /etc/hosts（可加 --sudo）"
     fi
   fi
+  refresh_local_known_hosts
 }
 
-# 远端一次性安装脚本：合并 authorized_keys / known_hosts / ssh config，并按需更新 /etc/hosts
+# 参数全部写进脚本文件，避免 ssh 远端把 # 当成注释（原先 $4 未绑定即因此）
 REMOTE_INSTALLER="$WORK_DIR/remote_install.sh"
-cat >"$REMOTE_INSTALLER" <<'REMOTE'
+cat >"$REMOTE_INSTALLER" <<REMOTE
 #!/usr/bin/env bash
 set -euo pipefail
-TAG="$1"
-SYNC_HOSTS="$2"
-USE_SUDO="$3"
-MARKER_BEGIN="$4"
-MARKER_END="$5"
+TAG='${INSTALL_TAG}'
+SYNC_HOSTS='${SYNC_HOSTS}'
+USE_SUDO='${REMOTE_SUDO}'
+MARKER_BEGIN='${MARKER_BEGIN}'
+MARKER_END='${MARKER_END}'
 umask 077
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-touch "$HOME/.ssh/authorized_keys" "$HOME/.ssh/known_hosts" "$HOME/.ssh/config"
+mkdir -p "\$HOME/.ssh"
+chmod 700 "\$HOME/.ssh"
+touch "\$HOME/.ssh/authorized_keys" "\$HOME/.ssh/known_hosts" "\$HOME/.ssh/config"
 
-sort -u "/tmp/cluster_authorized_keys.${TAG}" "$HOME/.ssh/authorized_keys" > "/tmp/ak.${TAG}"
-cat "/tmp/ak.${TAG}" > "$HOME/.ssh/authorized_keys"
-chmod 600 "$HOME/.ssh/authorized_keys"
+sort -u "/tmp/cluster_authorized_keys.\${TAG}" "\$HOME/.ssh/authorized_keys" > "/tmp/ak.\${TAG}"
+cat "/tmp/ak.\${TAG}" > "\$HOME/.ssh/authorized_keys"
+chmod 600 "\$HOME/.ssh/authorized_keys"
 
-sort -u "/tmp/cluster_known_hosts.${TAG}" "$HOME/.ssh/known_hosts" > "/tmp/kh.${TAG}"
-cat "/tmp/kh.${TAG}" > "$HOME/.ssh/known_hosts"
-chmod 600 "$HOME/.ssh/known_hosts"
+sort -u "/tmp/cluster_known_hosts.\${TAG}" "\$HOME/.ssh/known_hosts" > "/tmp/kh.\${TAG}"
+cat "/tmp/kh.\${TAG}" > "\$HOME/.ssh/known_hosts"
+chmod 600 "\$HOME/.ssh/known_hosts"
 
-awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
-  $0 == b {skip=1; next}
-  $0 == e {skip=0; next}
+awk -v b="\$MARKER_BEGIN" -v e="\$MARKER_END" '
+  \$0 == b {skip=1; next}
+  \$0 == e {skip=0; next}
   !skip {print}
-' "$HOME/.ssh/config" > "/tmp/cfg.${TAG}"
-cat "/tmp/cfg.${TAG}" "/tmp/cluster_ssh_config.${TAG}" > "$HOME/.ssh/config"
-chmod 600 "$HOME/.ssh/config"
+' "\$HOME/.ssh/config" > "/tmp/cfg.\${TAG}"
+cat "/tmp/cfg.\${TAG}" "/tmp/cluster_ssh_config.\${TAG}" > "\$HOME/.ssh/config"
+chmod 600 "\$HOME/.ssh/config"
 
-if [[ "$SYNC_HOSTS" == "1" ]]; then
+if [[ "\$SYNC_HOSTS" == "1" ]]; then
   run() {
-    if [[ "$USE_SUDO" == "1" ]]; then
-      sudo -n "$@"
+    if [[ "\$USE_SUDO" == "1" ]]; then
+      sudo -n "\$@"
     else
-      "$@"
+      "\$@"
     fi
   }
-  tmp="$(mktemp)"
-  run cat /etc/hosts > "$tmp" || { echo "无法读取 /etc/hosts，非 root 时请加 --sudo" >&2; exit 1; }
-  awk -v b="$MARKER_BEGIN" -v e="$MARKER_END" '
-    $0 == b {skip=1; next}
-    $0 == e {skip=0; next}
+  tmp="\$(mktemp)"
+  run cat /etc/hosts > "\$tmp" || { echo "无法读取 /etc/hosts，非 root 时请加 --sudo" >&2; exit 1; }
+  awk -v b="\$MARKER_BEGIN" -v e="\$MARKER_END" '
+    \$0 == b {skip=1; next}
+    \$0 == e {skip=0; next}
     !skip {print}
-  ' "$tmp" > "/tmp/hosts.${TAG}"
-  echo >> "/tmp/hosts.${TAG}"
-  cat "/tmp/cluster_hosts_block.${TAG}" >> "/tmp/hosts.${TAG}"
-  run cp "/tmp/hosts.${TAG}" /etc/hosts
-  rm -f "$tmp" "/tmp/hosts.${TAG}"
+  ' "\$tmp" > "/tmp/hosts.\${TAG}"
+  echo >> "/tmp/hosts.\${TAG}"
+  cat "/tmp/cluster_hosts_block.\${TAG}" >> "/tmp/hosts.\${TAG}"
+  run cp "/tmp/hosts.\${TAG}" /etc/hosts
+  rm -f "\$tmp" "/tmp/hosts.\${TAG}"
 fi
 
-rm -f "/tmp/cluster_authorized_keys.${TAG}" \
-      "/tmp/cluster_known_hosts.${TAG}" \
-      "/tmp/cluster_ssh_config.${TAG}" \
-      "/tmp/cluster_hosts_block.${TAG}" \
-      "/tmp/ak.${TAG}" "/tmp/kh.${TAG}" "/tmp/cfg.${TAG}" \
-      "/tmp/cluster_remote_install.${TAG}.sh"
+if command -v ssh-keyscan >/dev/null 2>&1 && [[ -f "/tmp/cluster_keyscan_targets.\${TAG}" ]]; then
+  while IFS= read -r t; do
+    [[ -n "\$t" ]] || continue
+    ssh-keyscan -T 8 "\$t" 2>/dev/null || true
+  done < "/tmp/cluster_keyscan_targets.\${TAG}" | grep -v '^#' >> "\$HOME/.ssh/known_hosts" || true
+  sort -u "\$HOME/.ssh/known_hosts" -o "\$HOME/.ssh/known_hosts"
+  chmod 600 "\$HOME/.ssh/known_hosts"
+fi
+
+rm -f "/tmp/cluster_authorized_keys.\${TAG}" \\
+      "/tmp/cluster_known_hosts.\${TAG}" \\
+      "/tmp/cluster_ssh_config.\${TAG}" \\
+      "/tmp/cluster_hosts_block.\${TAG}" \\
+      "/tmp/cluster_keyscan_targets.\${TAG}" \\
+      "/tmp/ak.\${TAG}" "/tmp/kh.\${TAG}" "/tmp/cfg.\${TAG}" \\
+      "/tmp/cluster_remote_install.\${TAG}.sh"
 REMOTE
 
 install_remote() {
   local ip="$1"
   local host="$2"
-  local tag="$$"
+  local tag="$INSTALL_TAG"
 
   if is_local_node "$ip" "$host"; then
     apply_trust_local
@@ -472,24 +525,33 @@ install_remote() {
   scp_put "$KNOWN" "$ip" "/tmp/cluster_known_hosts.${tag}"
   scp_put "$SSH_CONFIG_SNIPPET" "$ip" "/tmp/cluster_ssh_config.${tag}"
   scp_put "$HOSTS_BLOCK_FILE" "$ip" "/tmp/cluster_hosts_block.${tag}"
+  scp_put "$KEYSCAN_TARGETS" "$ip" "/tmp/cluster_keyscan_targets.${tag}"
   scp_put "$REMOTE_INSTALLER" "$ip" "/tmp/cluster_remote_install.${tag}.sh"
-  ssh_exec "$ip" bash "/tmp/cluster_remote_install.${tag}.sh" \
-    "$tag" "$SYNC_HOSTS" "$REMOTE_SUDO" "$MARKER_BEGIN" "$MARKER_END"
+  ssh_exec "$ip" bash "/tmp/cluster_remote_install.${tag}.sh"
 }
 
 log "分发 authorized_keys / known_hosts / ssh config，并同步集群 hosts"
 for i in "${!NODE_HOSTS[@]}"; do
-  log "  <- ${NODE_HOSTS[$i]} (${NODE_IPS[$i]})"
-  install_remote "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}"
+  if is_local_node "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}"; then
+    log "  <- ${NODE_HOSTS[$i]} (${NODE_IPS[$i]}) [本机]"
+    install_remote "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}"
+  fi
+done
+for i in "${!NODE_HOSTS[@]}"; do
+  if ! is_local_node "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}"; then
+    log "  <- ${NODE_HOSTS[$i]} (${NODE_IPS[$i]})"
+    install_remote "${NODE_IPS[$i]}" "${NODE_HOSTS[$i]}"
+  fi
 done
 
 verify_one() {
   local src_ip="$1" src_host="$2" dst_host="$3"
-  local cmd="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 ${SSH_USER}@${dst_host} hostname"
   if is_local_node "$src_ip" "$src_host"; then
-    bash -c "$cmd"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+      "${SSH_USER}@${dst_host}" hostname
   else
-    ssh_exec "$src_ip" "$cmd"
+    ssh_exec "$src_ip" ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+      "${SSH_USER}@${dst_host}" hostname
   fi
 }
 
