@@ -19,6 +19,9 @@
 
 set -euo pipefail
 
+# 若启动时没有打印这一版号，说明节点上仍是旧文件
+SCRIPT_VERSION="2"
+
 HOSTS_FILE="/etc/hosts"
 SSH_USER="root"
 PASSWORD="${SSH_PASSWORD:-}"
@@ -72,6 +75,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -r "$HOSTS_FILE" ]] || die "无法读取 hosts 文件: $HOSTS_FILE"
+
+log "脚本版本 ${SCRIPT_VERSION}（没有这行就是旧文件，请覆盖后再跑）"
 
 # 解析 IP 与主机名：controller01（精确）以及 compute 开头的短主机名
 parse_cluster_hosts() {
@@ -507,8 +512,7 @@ rm -f "/tmp/cluster_authorized_keys.\${TAG}" \\
       "/tmp/cluster_ssh_config.\${TAG}" \\
       "/tmp/cluster_hosts_block.\${TAG}" \\
       "/tmp/cluster_keyscan_targets.\${TAG}" \\
-      "/tmp/ak.\${TAG}" "/tmp/kh.\${TAG}" "/tmp/cfg.\${TAG}" \\
-      "/tmp/cluster_remote_install.\${TAG}.sh"
+      "/tmp/ak.\${TAG}" "/tmp/kh.\${TAG}" "/tmp/cfg.\${TAG}"
 REMOTE
 
 install_remote() {
@@ -526,8 +530,8 @@ install_remote() {
   scp_put "$SSH_CONFIG_SNIPPET" "$ip" "/tmp/cluster_ssh_config.${tag}"
   scp_put "$HOSTS_BLOCK_FILE" "$ip" "/tmp/cluster_hosts_block.${tag}"
   scp_put "$KEYSCAN_TARGETS" "$ip" "/tmp/cluster_keyscan_targets.${tag}"
-  scp_put "$REMOTE_INSTALLER" "$ip" "/tmp/cluster_remote_install.${tag}.sh"
-  ssh_exec "$ip" bash "/tmp/cluster_remote_install.${tag}.sh"
+  # 用 stdin 喂 bash -s，与收集公钥相同；不要再跟任何 # 开头的参数
+  ssh_exec "$ip" bash -s <"$REMOTE_INSTALLER"
 }
 
 log "分发 authorized_keys / known_hosts / ssh config，并同步集群 hosts"
