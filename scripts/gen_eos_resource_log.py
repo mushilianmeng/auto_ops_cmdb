@@ -3,21 +3,23 @@
 """
 移动云 EOS 资源包使用日志造数脚本
 
-澄清口径（项目期 3 个月，资源数为「每月」额度）:
-  - 订购开始: 2026-01-04 17:15 左右
-  - 自动续订最终到期: 2026-04-04
-  - 每个资源包有效期仅 1 个月（随月自动续订，共 3 个账期）
-  - 每月额度:
+按费用中心订单为准（示例：下行流量包）:
+  - 订单编号: MOP-T-26010448398352
+  - 订单创建时间: 2026-01-04 17:13:03
+  - 开通时间: 2026-01-04 17:13:04
+  - 到期时间: 2026-04-04 17:13:04
+  - 商品: 对象存储包 / 对象存储下行流量包(GB): 51200
+  - 计费方式: 包月计费（项目期 3 个月）
+  - 每月额度（6 个同类包合计）:
       * 标准存储次数: 6 亿次 = 60000 万次（单包 10000 万次 × 6）
       * 存储容量:     3 PB   = 3072000 GB（单包 512000 GB × 6）
       * 下行流量:     300 TB = 307200 GB（单包 51200 GB × 6）
   - 已使用量：每个月 4 号新账期从 0 重置，当月内缓慢增长到约 60%~80%
-    （不是一上来就 60%）
 
 用法:
   python3 scripts/gen_eos_resource_log.py
   python3 scripts/gen_eos_resource_log.py \\
-    --start "2026-01-04 17:15:00" --end "2026-03-31 23:59:59" -o /tmp/eos.log
+    --start "2026-01-04 17:13:04" --end "2026-03-31 23:59:59" -o /tmp/eos.log
 """
 from __future__ import print_function
 
@@ -34,11 +36,24 @@ ENDPOINT = "eos-chongqing-3.cmecloud.cn"
 ENDPOINT_INTERNAL = "eos-chongqing-3-internal.cmecloud.cn"
 BUCKET_DOMAIN = "yunchenkejieos001.eos-chongqing-3.cmecloud.cn"
 STORAGE_CLASS = "标准存储"
+ACCOUNT = "yunchenkeji"
 
-# ---------- 订购 / 续订 ----------
-ORDER_START = datetime(2026, 1, 4, 17, 15, 0)
-FINAL_EXPIRE = datetime(2026, 4, 4, 17, 15, 0)  # 自动续订最终到期
+# ---------- 订购 / 订单（以费用中心订单详情为准）----------
+ORDER_NO = "MOP-T-26010448398352"
+ORDER_BATCH_NO = "MOP-O-26010441749060"
+ORDER_CREATE = datetime(2026, 1, 4, 17, 13, 3)
+ORDER_START = datetime(2026, 1, 4, 17, 13, 4)   # 开通时间
+FINAL_EXPIRE = datetime(2026, 4, 4, 17, 13, 4)  # 到期时间
 PROJECT_MONTHS = 3
+ORDER_TYPE = "新建"
+ORDER_STATUS = "开通成功"
+BILLING_METHOD = "包月计费"
+PRODUCT_NAME = "对象存储包"
+# 截图中的下行流量包订单行
+TRAFFIC_RESOURCE_ID = "18733c89fdcf499eb252e0dfffd6f931"
+TRAFFIC_SUBSCRIBE_ID = "10062663572"
+TRAFFIC_UNIT_PRICE = 19497.0
+TRAFFIC_TOTAL_AMOUNT = 58491.0  # 19497 × 3 个月
 
 # ---------- 每月资源包规格（不是项目累计）----------
 PKG_CALL_EACH_WAN = 10000          # 万次 / 单包
@@ -54,6 +69,20 @@ PKG_TRAFFIC_COUNT = 6
 PKG_TRAFFIC_MONTH_GB = PKG_TRAFFIC_EACH_GB * PKG_TRAFFIC_COUNT  # 307200 GB = 300 TB/月
 
 OPS = ("PUT", "HEAD", "GET", "DELETE", "LIST")
+
+
+def derive_id(base, n, kind="res"):
+    """同规格多包时，#1 用订单真实 ID，其余由真实 ID 派生（可复现）。"""
+    if n == 1:
+        return base
+    h = hashlib.md5(("%s:%s:%d" % (base, kind, n)).encode("utf-8")).hexdigest()
+    if kind == "sub":
+        # 订购关系 ID 保持相近数字形态
+        try:
+            return str(int(base) + n - 1)
+        except ValueError:
+            return h[:11]
+    return h
 
 
 def parse_time(s):
@@ -318,9 +347,19 @@ class LogBuilder(object):
         self.emit(dt, "endpoint_public=%s" % ENDPOINT)
         self.emit(dt, "bucket_domain=%s" % BUCKET_DOMAIN)
         self.emit(dt, "endpoint_internal=%s" % ENDPOINT_INTERNAL)
-        self.emit(dt, "ORDER order_time=%s auto_renew=true final_expire=%s project_months=%d" % (
-            ts(self.order_start), ts(self.final_expire), PROJECT_MONTHS))
-        self.emit(dt, "BILLING note=资源数为每月额度; 每个资源包有效期=1个月; 到期自动续订")
+        self.emit(dt, "ORDER order_no=%s batch_no=%s account=%s type=%s status=%s" % (
+            ORDER_NO, ORDER_BATCH_NO, ACCOUNT, ORDER_TYPE, ORDER_STATUS))
+        self.emit(dt, "ORDER create_time=%s active=%s expire=%s billing=%s product=%s" % (
+            ts(ORDER_CREATE), ts(self.order_start), ts(self.final_expire),
+            BILLING_METHOD, PRODUCT_NAME))
+        self.emit(dt, "ORDER traffic_cfg=对象存储下行流量包(GB):%d "
+                   "resource_id=%s subscribe_id=%s unit_price=%.0f元/月 total_amount=%.2f "
+                   "months=%d" % (
+            PKG_TRAFFIC_EACH_GB, TRAFFIC_RESOURCE_ID, TRAFFIC_SUBSCRIBE_ID,
+            TRAFFIC_UNIT_PRICE, TRAFFIC_TOTAL_AMOUNT, PROJECT_MONTHS))
+        self.emit(dt, "ORDER note=开通/到期以订单为准; 包月计费; 每月4号进入下一计费周期用量从0累计")
+        self.emit(dt, "BILLING note=资源数为每月额度; 单包规格见 PACKAGE_PLAN; 订单到期=%s" % (
+            ts(self.final_expire)))
         for cy in self.cycles:
             self.emit(dt, "BILLING_CYCLE %s active=%s expire=%s auto_renew=%s" % (
                 cy["label"], ts(cy["start"]), ts(cy["end"]),
@@ -403,13 +442,20 @@ class LogBuilder(object):
                 PKG_TRAFFIC_EACH_GB, PKG_TRAFFIC_COUNT,
             ))
         for p in snap["traf_pkgs"]:
+            rid = derive_id(TRAFFIC_RESOURCE_ID, p["id"], "res")
+            sid = derive_id(TRAFFIC_SUBSCRIBE_ID, p["id"], "sub")
             self.emit(dt,
-                "%s TRAFFIC_PKG#%d cycle=%s region=%s spec=%sGB used=%sGB remain=%sGB "
-                "usage=%.2f%% active=%s expire=%s validity=%s auto_renew=%s status=生效中" % (
-                    tag, p["id"], p["cycle"], p["region"],
+                "%s TRAFFIC_PKG#%d cycle=%s region=%s product=%s "
+                "cfg=对象存储下行流量包(GB):%s "
+                "resource_id=%s subscribe_id=%s order_no=%s "
+                "spec=%sGB used=%sGB remain=%sGB usage=%.2f%% "
+                "active=%s expire=%s billing=%s status=%s" % (
+                    tag, p["id"], p["cycle"], p["region"], PRODUCT_NAME,
+                    fmt_gb(p["spec"]),
+                    rid, sid, ORDER_NO,
                     fmt_gb(p["spec"]), fmt_gb(p["used"]), fmt_gb(p["remain"]),
                     p["ratio"] * 100, p["active"], p["expire"],
-                    p["validity"], p["auto_renew"],
+                    BILLING_METHOD, ORDER_STATUS,
                 ))
 
         self.emit(dt,
@@ -594,18 +640,18 @@ class LogBuilder(object):
 def main():
     p = argparse.ArgumentParser(
         description="造 EOS 每月资源包使用日志（包有效期1个月，含总量/已使用量）")
-    p.add_argument("--start", default="2026-01-04 17:15:00",
-                   help="日志起始时间，默认订购时间 2026-01-04 17:15:00")
+    p.add_argument("--start", default="2026-01-04 17:13:04",
+                   help="日志起始时间，默认开通时间 2026-01-04 17:13:04")
     p.add_argument("--end", default="20260331",
                    help="日志结束时间，默认 20260331")
-    p.add_argument("--order-start", default="2026-01-04 17:15:00",
-                   help="资源包订购时间")
-    p.add_argument("--final-expire", default="2026-04-04 17:15:00",
-                   help="自动续订最终到期时间，默认 2026-04-04 17:15:00")
+    p.add_argument("--order-start", default="2026-01-04 17:13:04",
+                   help="资源包开通时间（订单开通时间）")
+    p.add_argument("--final-expire", default="2026-04-04 17:13:04",
+                   help="订单到期时间，默认 2026-04-04 17:13:04")
     p.add_argument("-o", "--output", default="-",
                    help="输出文件，默认 stdout")
     p.add_argument("--threads", type=int, default=64, help="模拟线程数")
-    p.add_argument("--seed", default="yunchenkejieos001-20260104",
+    p.add_argument("--seed", default="yunchenkejieos001-MOP-T-26010448398352",
                    help="随机种子，相同可复现")
     p.add_argument("--usage-start", type=float, default=0.0,
                    help="当月期初使用率，默认 0（每月4号重置从0开始）")
