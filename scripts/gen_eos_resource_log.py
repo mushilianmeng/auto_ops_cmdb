@@ -3,18 +3,20 @@
 """
 移动云 EOS 资源包使用日志造数脚本
 
-默认周期: 2026-01-05 ~ 2026-03-31
-资源包累计:
-  - 标准存储次数包: 单包 10000 万次 × 6 = 60000 万次 (6 亿次)
-  - 对象存储容量包: 单包 512000 GB × 6 = 3072000 GB (3000 TB)
-  - 下行流量包:     单包 51200 GB × 6 = 307200 GB (300 TB)
-已使用量按总量的 60%~80% 造数（随时间从约 60% 爬升到约 80%）
+澄清口径（项目期 3 个月，资源数为「每月」额度）:
+  - 订购开始: 2026-01-04 17:15 左右
+  - 自动续订最终到期: 2026-04-04
+  - 每个资源包有效期仅 1 个月（随月自动续订，共 3 个账期）
+  - 每月额度:
+      * 标准存储次数: 6 亿次 = 60000 万次（单包 10000 万次 × 6）
+      * 存储容量:     3 PB   = 3072000 GB（单包 512000 GB × 6）
+      * 下行流量:     300 TB = 307200 GB（单包 51200 GB × 6）
+  - 已使用量按「当月额度」的 60%~80% 造数（当月内从约 60% 爬到约 80%）
 
 用法:
   python3 scripts/gen_eos_resource_log.py
-  python3 scripts/gen_eos_resource_log.py --start 20260105 --end 20260331 -o /tmp/eos.log
-  python3 scripts/gen_eos_resource_log.py --start "2026-01-05 00:00:00" --end "2026-03-31 23:59:59"
-  python3 scripts/gen_eos_resource_log.py --usage-start 0.62 --usage-end 0.78 --seed demo
+  python3 scripts/gen_eos_resource_log.py \\
+    --start "2026-01-04 17:15:00" --end "2026-03-31 23:59:59" -o /tmp/eos.log
 """
 from __future__ import print_function
 
@@ -32,18 +34,23 @@ ENDPOINT_INTERNAL = "eos-chongqing-3-internal.cmecloud.cn"
 BUCKET_DOMAIN = "yunchenkejieos001.eos-chongqing-3.cmecloud.cn"
 STORAGE_CLASS = "标准存储"
 
-# ---------- 资源包规格（累计）----------
+# ---------- 订购 / 续订 ----------
+ORDER_START = datetime(2026, 1, 4, 17, 15, 0)
+FINAL_EXPIRE = datetime(2026, 4, 4, 17, 15, 0)  # 自动续订最终到期
+PROJECT_MONTHS = 3
+
+# ---------- 每月资源包规格（不是项目累计）----------
 PKG_CALL_EACH_WAN = 10000          # 万次 / 单包
 PKG_CALL_COUNT = 6
-PKG_CALL_TOTAL_WAN = PKG_CALL_EACH_WAN * PKG_CALL_COUNT  # 60000 万次
+PKG_CALL_MONTH_WAN = PKG_CALL_EACH_WAN * PKG_CALL_COUNT  # 60000 万次 = 6 亿次/月
 
 PKG_CAP_EACH_GB = 512000
 PKG_CAP_COUNT = 6
-PKG_CAP_TOTAL_GB = PKG_CAP_EACH_GB * PKG_CAP_COUNT       # 3072000 GB
+PKG_CAP_MONTH_GB = PKG_CAP_EACH_GB * PKG_CAP_COUNT       # 3072000 GB = 3 PB/月
 
 PKG_TRAFFIC_EACH_GB = 51200
 PKG_TRAFFIC_COUNT = 6
-PKG_TRAFFIC_TOTAL_GB = PKG_TRAFFIC_EACH_GB * PKG_TRAFFIC_COUNT  # 307200 GB
+PKG_TRAFFIC_MONTH_GB = PKG_TRAFFIC_EACH_GB * PKG_TRAFFIC_COUNT  # 307200 GB = 300 TB/月
 
 OPS = ("PUT", "HEAD", "GET", "DELETE", "LIST")
 
@@ -64,7 +71,7 @@ def parse_time(s):
             return dt
         except ValueError:
             pass
-    raise ValueError("时间格式错误，支持: 20260105 / 2026-01-05 / 2026-01-05 08:00:00")
+    raise ValueError("时间格式错误，支持: 20260105 / 2026-01-05 / 2026-01-04 17:15:00")
 
 
 def end_of_day(dt):
@@ -81,7 +88,6 @@ def ts(dt):
 
 
 def fmt_wan(v):
-    """万次，保留 2 位"""
     return "%.2f" % float(v)
 
 
@@ -93,6 +99,10 @@ def fmt_tb(gb):
     return "%.2f" % (float(gb) / 1024.0)
 
 
+def fmt_pb(gb):
+    return "%.2f" % (float(gb) / 1024.0 / 1024.0)
+
+
 def lerp(a, b, t):
     return a + (b - a) * t
 
@@ -101,74 +111,105 @@ def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 
-class ResourceState(object):
-    """按时间进度计算三类资源包总量/已用（60%~80% 区间内爬升 + 抖动）"""
+def build_billing_cycles(order_start, months):
+    """每月一账期，包有效期刚好一个月；第 months 期到期日 = order_start + months 月"""
+    cycles = []
+    for i in range(months):
+        # 按「同日同时刻」进一个月，避免日历差异；用 replace 处理跨月
+        y = order_start.year
+        m = order_start.month + i
+        while m > 12:
+            y += 1
+            m -= 12
+        start = order_start.replace(year=y, month=m)
+        y2 = order_start.year
+        m2 = order_start.month + i + 1
+        while m2 > 12:
+            y2 += 1
+            m2 -= 12
+        end = order_start.replace(year=y2, month=m2)
+        cycles.append({
+            "index": i + 1,
+            "start": start,
+            "end": end,
+            "label": "M%d" % (i + 1),
+            "auto_renew": i < months - 1,
+        })
+    return cycles
 
-    def __init__(self, start, end, usage_start, usage_end, seed):
-        self.start = start
-        self.end = end
+
+class ResourceState(object):
+    """按「当前账期（一个月）」计算当月额度总量/已用（60%~80%）"""
+
+    def __init__(self, cycles, usage_start, usage_end, seed):
+        self.cycles = cycles
         self.usage_start = usage_start
         self.usage_end = usage_end
         self.seed = seed
-        self.span = max((end - start).total_seconds(), 1.0)
         self._i = 0
 
     def _r(self):
         self._i += 1
         return rng(self.seed, self._i)
 
-    def progress(self, dt):
-        t = (dt - self.start).total_seconds() / self.span
-        return clamp(t, 0.0, 1.0)
+    def cycle_for(self, dt):
+        for c in self.cycles:
+            if c["start"] <= dt < c["end"]:
+                return c
+        # 边界：刚好到期时刻算最后一期
+        if dt >= self.cycles[-1]["end"]:
+            return self.cycles[-1]
+        return self.cycles[0]
 
     def usage_ratio(self, dt):
-        # 主趋势 60%->80%，叠加小幅日抖动，始终落在 [usage_start, usage_end]
-        base = lerp(self.usage_start, self.usage_end, self.progress(dt))
-        jitter = (self._r() - 0.5) * 0.03  # ±1.5%
+        c = self.cycle_for(dt)
+        span = max((c["end"] - c["start"]).total_seconds(), 1.0)
+        t = clamp((dt - c["start"]).total_seconds() / span, 0.0, 1.0)
+        base = lerp(self.usage_start, self.usage_end, t)
+        jitter = (self._r() - 0.5) * 0.03
         return clamp(base + jitter, self.usage_start, self.usage_end)
 
     def snapshot(self, dt):
+        c = self.cycle_for(dt)
         ratio = self.usage_ratio(dt)
-        # 各包使用略有不均，但总和贴近 ratio * total
-        call_used = PKG_CALL_TOTAL_WAN * ratio
-        cap_used = PKG_CAP_TOTAL_GB * ratio
-        traf_used = PKG_TRAFFIC_TOTAL_GB * ratio
+        call_used = PKG_CALL_MONTH_WAN * ratio
+        cap_used = PKG_CAP_MONTH_GB * ratio
+        traf_used = PKG_TRAFFIC_MONTH_GB * ratio
 
         call_pkgs = self._split_packages(
-            PKG_CALL_COUNT, PKG_CALL_EACH_WAN, call_used, "call", dt
+            PKG_CALL_COUNT, PKG_CALL_EACH_WAN, call_used, "call", c, dt
         )
         cap_pkgs = self._split_packages(
-            PKG_CAP_COUNT, PKG_CAP_EACH_GB, cap_used, "cap", dt
+            PKG_CAP_COUNT, PKG_CAP_EACH_GB, cap_used, "cap", c, dt
         )
         traf_pkgs = self._split_packages(
-            PKG_TRAFFIC_COUNT, PKG_TRAFFIC_EACH_GB, traf_used, "traf", dt
+            PKG_TRAFFIC_COUNT, PKG_TRAFFIC_EACH_GB, traf_used, "traf", c, dt
         )
 
         return {
+            "cycle": c,
             "ratio": ratio,
-            "call_total": PKG_CALL_TOTAL_WAN,
+            "call_total": PKG_CALL_MONTH_WAN,
             "call_used": sum(p["used"] for p in call_pkgs),
-            "call_remain": PKG_CALL_TOTAL_WAN - sum(p["used"] for p in call_pkgs),
+            "call_remain": PKG_CALL_MONTH_WAN - sum(p["used"] for p in call_pkgs),
             "call_pkgs": call_pkgs,
-            "cap_total": PKG_CAP_TOTAL_GB,
+            "cap_total": PKG_CAP_MONTH_GB,
             "cap_used": sum(p["used"] for p in cap_pkgs),
-            "cap_remain": PKG_CAP_TOTAL_GB - sum(p["used"] for p in cap_pkgs),
+            "cap_remain": PKG_CAP_MONTH_GB - sum(p["used"] for p in cap_pkgs),
             "cap_pkgs": cap_pkgs,
-            "traf_total": PKG_TRAFFIC_TOTAL_GB,
+            "traf_total": PKG_TRAFFIC_MONTH_GB,
             "traf_used": sum(p["used"] for p in traf_pkgs),
-            "traf_remain": PKG_TRAFFIC_TOTAL_GB - sum(p["used"] for p in traf_pkgs),
+            "traf_remain": PKG_TRAFFIC_MONTH_GB - sum(p["used"] for p in traf_pkgs),
             "traf_pkgs": traf_pkgs,
         }
 
-    def _split_packages(self, n, each, total_used, kind, dt):
-        """把总已用量拆到 n 个单包；单包使用率也落在 60%~80% 附近"""
+    def _split_packages(self, n, each, total_used, kind, cycle, dt):
         avg_ratio = total_used / float(each * n) if each and n else 0.0
-        # 单包在均值附近小幅波动，并夹紧到 [usage_start, usage_end]
         ratios = []
         for i in range(n):
-            jitter = (rng("%s-%s" % (self.seed, kind), i * 17 + dt.toordinal()) - 0.5) * 0.08
+            jitter = (rng("%s-%s-M%d" % (self.seed, kind, cycle["index"]),
+                          i * 17 + dt.toordinal()) - 0.5) * 0.08
             ratios.append(clamp(avg_ratio + jitter, self.usage_start, self.usage_end))
-        # 归一化，使 sum(used) == total_used，同时尽量不越界
         raw = [each * r for r in ratios]
         raw_sum = sum(raw) or 1.0
         scale = total_used / raw_sum
@@ -176,27 +217,28 @@ class ResourceState(object):
         allocated = 0.0
         lo = each * self.usage_start
         hi = each * self.usage_end
+        active = cycle["start"].strftime("%Y-%m-%d %H:%M:%S")
+        expire = cycle["end"].strftime("%Y-%m-%d %H:%M:%S")
         for i in range(n):
             if i == n - 1:
-                used = clamp(total_used - allocated, lo, hi)
-                # 若受夹紧影响产生漂移，吞在最后一包可调范围内
-                used = clamp(used, 0.0, each)
+                used = clamp(total_used - allocated, 0.0, each)
+                used = clamp(used, lo, hi) if lo <= hi else used
             else:
                 used = clamp(raw[i] * scale, lo, hi)
             allocated += used
-            active_day = self.start + timedelta(days=i * 14)
-            expire_day = active_day + timedelta(days=365)
             pkgs.append({
                 "id": i + 1,
                 "spec": each,
                 "used": used,
                 "remain": each - used,
                 "ratio": used / each if each else 0.0,
-                "active": active_day.strftime("%Y-%m-%d"),
-                "expire": expire_day.strftime("%Y-%m-%d"),
+                "active": active,
+                "expire": expire,
                 "region": REGION_CN,
+                "cycle": cycle["label"],
+                "validity": "1个月",
+                "auto_renew": "是" if cycle["auto_renew"] else "否(末期)",
             })
-        # 二次校准总和
         drift = total_used - sum(p["used"] for p in pkgs)
         if pkgs and abs(drift) > 0.01:
             for p in reversed(pkgs):
@@ -213,14 +255,17 @@ class ResourceState(object):
 
 class LogBuilder(object):
     def __init__(self, start, end, threads, seed, usage_start, usage_end,
-                 sample_minutes, verbose_ratio):
+                 sample_minutes, verbose_ratio, order_start, final_expire):
         self.start = start
         self.end = end
         self.threads = threads
         self.seed = seed
         self.sample_minutes = sample_minutes
         self.verbose_ratio = verbose_ratio
-        self.state = ResourceState(start, end, usage_start, usage_end, seed)
+        self.order_start = order_start
+        self.final_expire = final_expire
+        self.cycles = build_billing_cycles(order_start, PROJECT_MONTHS)
+        self.state = ResourceState(self.cycles, usage_start, usage_end, seed)
         self.lines = []
         self.i = 0
         self.objects = 0
@@ -244,35 +289,48 @@ class LogBuilder(object):
     def write_banner(self, dt):
         pid = 12000 + int(self.r() * 40000)
         snap = self.state.snapshot(dt)
+        c = snap["cycle"]
         self.emit(dt, "========== EOS resource burn / report start ==========")
-        self.emit(dt, "pid=%d python=3.6 period=%s ~ %s" % (
+        self.emit(dt, "pid=%d python=3.6 log_period=%s ~ %s" % (
             pid, ts(self.start), ts(self.end)))
         self.emit(dt, "bucket=%s region=%s location=%s storage=%s" % (
             BUCKET, REGION_CN, LOCATION, STORAGE_CLASS))
         self.emit(dt, "endpoint_public=%s" % ENDPOINT)
         self.emit(dt, "bucket_domain=%s" % BUCKET_DOMAIN)
         self.emit(dt, "endpoint_internal=%s" % ENDPOINT_INTERNAL)
-        self.emit(dt, "threads=%d seed=%s" % (self.threads, self.seed))
-        self.emit(dt, "PACKAGE_PLAN calls: 单包=%d万次 × %d = 累计=%d万次 (%.0f亿次)" % (
-            PKG_CALL_EACH_WAN, PKG_CALL_COUNT, PKG_CALL_TOTAL_WAN,
-            PKG_CALL_TOTAL_WAN / 10000.0))
-        self.emit(dt, "PACKAGE_PLAN capacity: 单包=%dGB × %d = 累计=%dGB (%sTB)" % (
-            PKG_CAP_EACH_GB, PKG_CAP_COUNT, PKG_CAP_TOTAL_GB,
-            fmt_tb(PKG_CAP_TOTAL_GB)))
-        self.emit(dt, "PACKAGE_PLAN traffic: 单包=%dGB × %d = 累计=%dGB (%sTB)" % (
-            PKG_TRAFFIC_EACH_GB, PKG_TRAFFIC_COUNT, PKG_TRAFFIC_TOTAL_GB,
-            fmt_tb(PKG_TRAFFIC_TOTAL_GB)))
-        self.emit(dt, "USAGE_POLICY target_ratio=%.0f%%~%.0f%% (current~%.1f%%)" % (
+        self.emit(dt, "ORDER order_time=%s auto_renew=true final_expire=%s project_months=%d" % (
+            ts(self.order_start), ts(self.final_expire), PROJECT_MONTHS))
+        self.emit(dt, "BILLING note=资源数为每月额度; 每个资源包有效期=1个月; 到期自动续订")
+        for cy in self.cycles:
+            self.emit(dt, "BILLING_CYCLE %s active=%s expire=%s auto_renew=%s" % (
+                cy["label"], ts(cy["start"]), ts(cy["end"]),
+                "yes" if cy["auto_renew"] else "no"))
+        self.emit(dt, "PACKAGE_PLAN_MONTHLY calls: 单包=%d万次 × %d = 每月=%d万次 (%.0f亿次/月)" % (
+            PKG_CALL_EACH_WAN, PKG_CALL_COUNT, PKG_CALL_MONTH_WAN,
+            PKG_CALL_MONTH_WAN / 10000.0))
+        self.emit(dt, "PACKAGE_PLAN_MONTHLY capacity: 单包=%dGB × %d = 每月=%dGB (%sTB/%sPB /月)" % (
+            PKG_CAP_EACH_GB, PKG_CAP_COUNT, PKG_CAP_MONTH_GB,
+            fmt_tb(PKG_CAP_MONTH_GB), fmt_pb(PKG_CAP_MONTH_GB)))
+        self.emit(dt, "PACKAGE_PLAN_MONTHLY traffic: 单包=%dGB × %d = 每月=%dGB (%sTB/月)" % (
+            PKG_TRAFFIC_EACH_GB, PKG_TRAFFIC_COUNT, PKG_TRAFFIC_MONTH_GB,
+            fmt_tb(PKG_TRAFFIC_MONTH_GB)))
+        self.emit(dt, "CURRENT_CYCLE %s active=%s expire=%s" % (
+            c["label"], ts(c["start"]), ts(c["end"])))
+        self.emit(dt, "USAGE_POLICY monthly_target_ratio=%.0f%%~%.0f%% (current~%.1f%%)" % (
             self.state.usage_start * 100, self.state.usage_end * 100, snap["ratio"] * 100))
 
     def emit_package_report(self, dt, tag="RESOURCE"):
         snap = self.state.snapshot(dt)
-        self.emit(dt, "----- %s SNAPSHOT bucket=%s -----" % (tag, BUCKET))
+        c = snap["cycle"]
+        self.emit(dt, "----- %s SNAPSHOT bucket=%s cycle=%s (valid 1 month) -----" % (
+            tag, BUCKET, c["label"]))
+        self.emit(dt, "%s CYCLE active=%s expire=%s auto_renew=%s final_expire=%s" % (
+            tag, ts(c["start"]), ts(c["end"]),
+            "yes" if c["auto_renew"] else "no", ts(self.final_expire)))
 
-        # 次数包汇总
         self.emit(dt,
-            "%s CALL_PKG total=%s万次 used=%s万次 remain=%s万次 usage=%.2f%% "
-            "(单包=%d万次 × %d包)" % (
+            "%s CALL_PKG scope=monthly total=%s万次(6亿次/月) used=%s万次 remain=%s万次 "
+            "usage=%.2f%% (单包=%d万次 × %d包, 有效期=1个月)" % (
                 tag,
                 fmt_wan(snap["call_total"]),
                 fmt_wan(snap["call_used"]),
@@ -282,19 +340,19 @@ class LogBuilder(object):
             ))
         for p in snap["call_pkgs"]:
             self.emit(dt,
-                "%s CALL_PKG#%d region=%s spec=%s万次 used=%s万次 remain=%s万次 "
-                "usage=%.2f%% active=%s expire=%s status=生效中" % (
-                    tag, p["id"], p["region"],
+                "%s CALL_PKG#%d cycle=%s region=%s spec=%s万次 used=%s万次 remain=%s万次 "
+                "usage=%.2f%% active=%s expire=%s validity=%s auto_renew=%s status=生效中" % (
+                    tag, p["id"], p["cycle"], p["region"],
                     fmt_wan(p["spec"]), fmt_wan(p["used"]), fmt_wan(p["remain"]),
                     p["ratio"] * 100, p["active"], p["expire"],
+                    p["validity"], p["auto_renew"],
                 ))
 
-        # 容量包汇总
         self.emit(dt,
-            "%s CAP_PKG total=%sGB(%sTB) used=%sGB(%sTB) remain=%sGB(%sTB) "
-            "usage=%.2f%% (单包=%dGB × %d包)" % (
+            "%s CAP_PKG scope=monthly total=%sGB(%sTB/%sPB /月) used=%sGB(%sTB) "
+            "remain=%sGB(%sTB) usage=%.2f%% (单包=%dGB × %d包, 有效期=1个月)" % (
                 tag,
-                fmt_gb(snap["cap_total"]), fmt_tb(snap["cap_total"]),
+                fmt_gb(snap["cap_total"]), fmt_tb(snap["cap_total"]), fmt_pb(snap["cap_total"]),
                 fmt_gb(snap["cap_used"]), fmt_tb(snap["cap_used"]),
                 fmt_gb(snap["cap_remain"]), fmt_tb(snap["cap_remain"]),
                 snap["cap_used"] / snap["cap_total"] * 100,
@@ -302,17 +360,17 @@ class LogBuilder(object):
             ))
         for p in snap["cap_pkgs"]:
             self.emit(dt,
-                "%s CAP_PKG#%d region=%s spec=%sGB used=%sGB remain=%sGB "
-                "usage=%.2f%% active=%s expire=%s status=生效中" % (
-                    tag, p["id"], p["region"],
+                "%s CAP_PKG#%d cycle=%s region=%s spec=%sGB used=%sGB remain=%sGB "
+                "usage=%.2f%% active=%s expire=%s validity=%s auto_renew=%s status=生效中" % (
+                    tag, p["id"], p["cycle"], p["region"],
                     fmt_gb(p["spec"]), fmt_gb(p["used"]), fmt_gb(p["remain"]),
                     p["ratio"] * 100, p["active"], p["expire"],
+                    p["validity"], p["auto_renew"],
                 ))
 
-        # 下行流量包汇总
         self.emit(dt,
-            "%s TRAFFIC_PKG total=%sGB(%sTB) used=%sGB(%sTB) remain=%sGB(%sTB) "
-            "usage=%.2f%% (单包=%dGB × %d包)" % (
+            "%s TRAFFIC_PKG scope=monthly total=%sGB(%sTB/月) used=%sGB(%sTB) "
+            "remain=%sGB(%sTB) usage=%.2f%% (单包=%dGB × %d包, 有效期=1个月)" % (
                 tag,
                 fmt_gb(snap["traf_total"]), fmt_tb(snap["traf_total"]),
                 fmt_gb(snap["traf_used"]), fmt_tb(snap["traf_used"]),
@@ -322,17 +380,18 @@ class LogBuilder(object):
             ))
         for p in snap["traf_pkgs"]:
             self.emit(dt,
-                "%s TRAFFIC_PKG#%d region=%s spec=%sGB used=%sGB remain=%sGB "
-                "usage=%.2f%% active=%s expire=%s status=生效中" % (
-                    tag, p["id"], p["region"],
+                "%s TRAFFIC_PKG#%d cycle=%s region=%s spec=%sGB used=%sGB remain=%sGB "
+                "usage=%.2f%% active=%s expire=%s validity=%s auto_renew=%s status=生效中" % (
+                    tag, p["id"], p["cycle"], p["region"],
                     fmt_gb(p["spec"]), fmt_gb(p["used"]), fmt_gb(p["remain"]),
                     p["ratio"] * 100, p["active"], p["expire"],
+                    p["validity"], p["auto_renew"],
                 ))
 
         self.emit(dt,
-            "%s SUMMARY overall_usage~%.2f%% calls_used=%s万次 cap_used=%sGB "
-            "traffic_used=%sGB endpoint=%s" % (
-                tag, snap["ratio"] * 100,
+            "%s SUMMARY cycle=%s overall_usage~%.2f%% calls_used=%s万次 "
+            "cap_used=%sGB traffic_used=%sGB endpoint=%s" % (
+                tag, c["label"], snap["ratio"] * 100,
                 fmt_wan(snap["call_used"]),
                 fmt_gb(snap["cap_used"]),
                 fmt_gb(snap["traf_used"]),
@@ -341,7 +400,6 @@ class LogBuilder(object):
         return snap
 
     def emit_ops_burst(self, dt, day_index):
-        """每个采样点穿插一批操作日志"""
         burst = 8 + int(self.r() * 20)
         for n in range(burst):
             wid = 1 + int(self.r() * self.threads)
@@ -376,7 +434,6 @@ class LogBuilder(object):
                     self.emit(dt, "[thread-%02d] HEAD ok s3://%s/%s latency=%dms" % (
                         wid, BUCKET, name, lag))
 
-            # 偶发错误
             if self.r() < 0.012:
                 self.errors += 1
                 code = [429, 500, 503, 408][int(self.r() * 4)]
@@ -389,35 +446,35 @@ class LogBuilder(object):
                 else:
                     self.emit(dt, "[thread-%02d] INFO %s %s retry ok" % (wid, op, name))
 
-        # 进度行（兼容旧格式）
         elapsed = max((dt - self.start).total_seconds(), 1.0)
         qps = self.calls / elapsed * (0.9 + self.r() * 0.25)
-        # 放大显示感：采样点累计 objects
         show_objects = max(self.objects, int(self.calls / 4))
-        self.emit(dt, "STAT objects=%d calls=%d errors=%d ~%.0f calls/s threads_active=%d" % (
-            show_objects, self.calls, self.errors, max(qps, 1), self.threads))
+        c = self.state.cycle_for(dt)
+        self.emit(dt, "STAT cycle=%s objects=%d calls=%d errors=%d ~%.0f calls/s threads_active=%d" % (
+            c["label"], show_objects, self.calls, self.errors, max(qps, 1), self.threads))
         self.emit(dt, "STAT io stored~%.2fGB downloaded~%.2fGB bucket=%s" % (
             self.bytes_stored / 1024.0 / 1024.0 / 1024.0,
             self.bytes_down / 1024.0 / 1024.0 / 1024.0,
             BUCKET,
         ))
 
-    def emit_monthly_rollup(self, dt):
-        snap = self.emit_package_report(dt, tag="MONTHLY")
-        month_key = dt.strftime("%Y-%m")
-        self.emit(dt, "MONTHLY ROLLUP month=%s bucket=%s location=%s" % (
-            month_key, BUCKET, LOCATION))
-        self.emit(dt, "MONTHLY ROLLUP 标准存储次数包 总量=%s万次 已使用=%s万次 使用率=%.2f%%" % (
-            fmt_wan(snap["call_total"]), fmt_wan(snap["call_used"]),
+    def emit_cycle_rollup(self, dt, tag="CYCLE"):
+        snap = self.emit_package_report(dt, tag=tag)
+        c = snap["cycle"]
+        self.emit(dt, "%s ROLLUP cycle=%s active=%s expire=%s bucket=%s" % (
+            tag, c["label"], ts(c["start"]), ts(c["end"]), BUCKET))
+        self.emit(dt, "%s ROLLUP 标准存储次数包(每月) 总量=%s万次(6亿次) 已使用=%s万次 使用率=%.2f%%" % (
+            tag, fmt_wan(snap["call_total"]), fmt_wan(snap["call_used"]),
             snap["call_used"] / snap["call_total"] * 100))
-        self.emit(dt, "MONTHLY ROLLUP 对象存储容量包 总量=%sGB(%sTB) 已使用=%sGB(%sTB) 使用率=%.2f%%" % (
-            fmt_gb(snap["cap_total"]), fmt_tb(snap["cap_total"]),
-            fmt_gb(snap["cap_used"]), fmt_tb(snap["cap_used"]),
+        self.emit(dt, "%s ROLLUP 对象存储容量包(每月) 总量=%sGB(%sPB) 已使用=%sGB 使用率=%.2f%%" % (
+            tag, fmt_gb(snap["cap_total"]), fmt_pb(snap["cap_total"]),
+            fmt_gb(snap["cap_used"]),
             snap["cap_used"] / snap["cap_total"] * 100))
-        self.emit(dt, "MONTHLY ROLLUP 对象存储下行流量包 总量=%sGB(%sTB) 已使用=%sGB(%sTB) 使用率=%.2f%%" % (
-            fmt_gb(snap["traf_total"]), fmt_tb(snap["traf_total"]),
-            fmt_gb(snap["traf_used"]), fmt_tb(snap["traf_used"]),
+        self.emit(dt, "%s ROLLUP 对象存储下行流量包(每月) 总量=%sGB(%sTB) 已使用=%sGB 使用率=%.2f%%" % (
+            tag, fmt_gb(snap["traf_total"]), fmt_tb(snap["traf_total"]),
+            fmt_gb(snap["traf_used"]),
             snap["traf_used"] / snap["traf_total"] * 100))
+        return snap
 
     def build(self):
         cur = self.start
@@ -430,64 +487,73 @@ class LogBuilder(object):
                           t, ENDPOINT))
 
         day_index = 0
-        last_month = None
+        last_cycle = None
         sample = timedelta(minutes=self.sample_minutes)
         cur = self.start + timedelta(minutes=5)
 
         while cur <= self.end:
             day_index += 1
+            c = self.state.cycle_for(cur)
+
+            # 跨账期：上一期收官 + 续订生效
+            if last_cycle is None:
+                last_cycle = c["index"]
+            if c["index"] != last_cycle:
+                prev = self.cycles[last_cycle - 1]
+                edge = prev["end"] - timedelta(seconds=1)
+                if edge >= self.start:
+                    self.emit_cycle_rollup(edge, tag="CYCLE_END")
+                self.emit(cur, "AUTORENEW previous=%s -> current=%s new_active=%s new_expire=%s "
+                               "final_expire=%s" % (
+                                   prev["label"], c["label"], ts(c["start"]), ts(c["end"]),
+                                   ts(self.final_expire)))
+                self.emit_package_report(cur, tag="RENEW")
+                last_cycle = c["index"]
+
             self.emit_ops_burst(cur, day_index)
 
-            # 每 6 个采样点打一次完整资源包快照
             if day_index % 6 == 0:
                 self.emit_package_report(cur, tag="RESOURCE")
 
-            # 心跳
             if day_index % 3 == 0:
                 uptime = int((cur - self.start).total_seconds())
-                self.emit(cur, "HEARTBEAT uptime=%ds rss~%dMB fd=%d conn_pool=%d/%d" % (
-                    uptime,
+                self.emit(cur, "HEARTBEAT cycle=%s uptime=%ds rss~%dMB fd=%d conn_pool=%d/%d" % (
+                    c["label"], uptime,
                     90 + int(self.r() * 140),
                     220 + int(self.r() * 500),
                     int(self.threads * (0.65 + self.r() * 0.35)),
                     self.threads,
                 ))
 
-            # 月初/月末月报
-            month = cur.strftime("%Y-%m")
-            if last_month is None:
-                last_month = month
-            if month != last_month:
-                # 上个月最后时刻月报
-                month_end = cur.replace(day=1) - timedelta(seconds=1)
-                if month_end >= self.start:
-                    self.emit_monthly_rollup(month_end)
-                last_month = month
-
-            # 每天一次简要配额行（保证“总量/已使用”高频可见）
             if cur.hour in (0, 8, 14, 20) or day_index % 4 == 1:
                 snap = self.state.snapshot(cur)
                 self.emit(cur,
-                    "QUOTA calls_total=%s万次 calls_used=%s万次 | "
+                    "QUOTA scope=monthly cycle=%s "
+                    "calls_total=%s万次 calls_used=%s万次 | "
                     "cap_total=%sGB cap_used=%sGB | "
-                    "traffic_total=%sGB traffic_used=%sGB | usage~%.1f%%" % (
+                    "traffic_total=%sGB traffic_used=%sGB | "
+                    "usage~%.1f%% pkg_expire=%s final_expire=%s" % (
+                        snap["cycle"]["label"],
                         fmt_wan(snap["call_total"]), fmt_wan(snap["call_used"]),
                         fmt_gb(snap["cap_total"]), fmt_gb(snap["cap_used"]),
                         fmt_gb(snap["traf_total"]), fmt_gb(snap["traf_used"]),
                         snap["ratio"] * 100,
+                        ts(snap["cycle"]["end"]),
+                        ts(self.final_expire),
                     ))
 
             cur += sample
 
-        # 周期结束月报 + 终态
-        self.emit_monthly_rollup(self.end)
-        final = self.emit_package_report(self.end, tag="FINAL")
+        self.emit_cycle_rollup(self.end, tag="FINAL")
+        final = self.state.snapshot(self.end)
         self.emit(self.end, "========== EOS resource burn / report end ==========")
         self.emit(self.end,
-            "FINAL_CHECK period=%s~%s calls_used=%s/%s万次(%.1f%%) "
-            "cap_used=%s/%sGB(%.1f%%) traffic_used=%s/%sGB(%.1f%%)" % (
-                self.start.strftime("%Y%m%d"),
-                self.end.strftime("%Y%m%d"),
+            "FINAL_CHECK order=%s final_expire=%s "
+            "current_cycle=%s calls_used=%s/%s万次(%.1f%%) "
+            "cap_used=%s/%sGB(%.1f%%) traffic_used=%s/%sGB(%.1f%%) "
+            "note=以上为当月额度使用率(包有效期1个月)" % (
+                ts(self.order_start), ts(self.final_expire),
+                final["cycle"]["label"],
                 fmt_wan(final["call_used"]), fmt_wan(final["call_total"]),
                 final["call_used"] / final["call_total"] * 100,
                 fmt_gb(final["cap_used"]), fmt_gb(final["cap_total"]),
@@ -499,22 +565,27 @@ class LogBuilder(object):
 
 
 def main():
-    p = argparse.ArgumentParser(description="造 EOS 资源包使用复杂日志（含总量/已使用量）")
-    p.add_argument("--start", default="20260105",
-                   help="起始时间，默认 20260105")
+    p = argparse.ArgumentParser(
+        description="造 EOS 每月资源包使用日志（包有效期1个月，含总量/已使用量）")
+    p.add_argument("--start", default="2026-01-04 17:15:00",
+                   help="日志起始时间，默认订购时间 2026-01-04 17:15:00")
     p.add_argument("--end", default="20260331",
-                   help="结束时间，默认 20260331")
+                   help="日志结束时间，默认 20260331")
+    p.add_argument("--order-start", default="2026-01-04 17:15:00",
+                   help="资源包订购时间")
+    p.add_argument("--final-expire", default="2026-04-04 17:15:00",
+                   help="自动续订最终到期时间，默认 2026-04-04 17:15:00")
     p.add_argument("-o", "--output", default="-",
                    help="输出文件，默认 stdout")
     p.add_argument("--threads", type=int, default=64, help="模拟线程数")
-    p.add_argument("--seed", default="yunchenkejieos001-20260105",
+    p.add_argument("--seed", default="yunchenkejieos001-20260104",
                    help="随机种子，相同可复现")
     p.add_argument("--usage-start", type=float, default=0.60,
-                   help="期初使用率，默认 0.60")
+                   help="当月期初使用率，默认 0.60")
     p.add_argument("--usage-end", type=float, default=0.80,
-                   help="期末使用率，默认 0.80")
+                   help="当月期末使用率，默认 0.80")
     p.add_argument("--sample-minutes", type=int, default=180,
-                   help="采样间隔分钟，默认 180（3小时一条业务块，周期日志更可控）")
+                   help="采样间隔分钟，默认 180")
     p.add_argument("--verbose-ratio", type=float, default=0.15,
                    help="详细请求日志比例 0~1")
     args = p.parse_args()
@@ -528,9 +599,10 @@ def main():
 
     start = parse_time(args.start)
     end = parse_time(args.end)
-    # 若只给日期，结束日接到 23:59:59
     if len(str(args.end).strip()) <= 10:
         end = end_of_day(end)
+    order_start = parse_time(args.order_start)
+    final_expire = parse_time(args.final_expire)
     if end < start:
         print("end 不能早于 start", file=sys.stderr)
         sys.exit(2)
@@ -544,6 +616,8 @@ def main():
         usage_end=args.usage_end,
         sample_minutes=args.sample_minutes,
         verbose_ratio=args.verbose_ratio,
+        order_start=order_start,
+        final_expire=final_expire,
     )
     lines = builder.build()
     text = "\n".join(lines) + "\n"
@@ -553,7 +627,6 @@ def main():
     else:
         with open(args.output, "w") as f:
             f.write(text)
-        # 抽样校验使用率
         final_lines = [ln for ln in lines if "FINAL_CHECK" in ln]
         print("lines=%d -> %s" % (len(lines), args.output), file=sys.stderr)
         if final_lines:
