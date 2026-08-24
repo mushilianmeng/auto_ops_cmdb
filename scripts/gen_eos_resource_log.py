@@ -11,7 +11,8 @@
       * 标准存储次数: 6 亿次 = 60000 万次（单包 10000 万次 × 6）
       * 存储容量:     3 PB   = 3072000 GB（单包 512000 GB × 6）
       * 下行流量:     300 TB = 307200 GB（单包 51200 GB × 6）
-  - 已使用量按「当月额度」的 60%~80% 造数（当月内从约 60% 爬到约 80%）
+  - 已使用量：每个月 4 号新账期从 0 重置，当月内缓慢增长到约 60%~80%
+    （不是一上来就 60%）
 
 用法:
   python3 scripts/gen_eos_resource_log.py
@@ -165,12 +166,18 @@ class ResourceState(object):
         return self.cycles[0]
 
     def usage_ratio(self, dt):
+        """账期内从 0 缓慢增长到 usage_end；每月 4 号换期后重新从 0 开始。"""
         c = self.cycle_for(dt)
         span = max((c["end"] - c["start"]).total_seconds(), 1.0)
         t = clamp((dt - c["start"]).total_seconds() / span, 0.0, 1.0)
-        base = lerp(self.usage_start, self.usage_end, t)
-        jitter = (self._r() - 0.5) * 0.03
-        return clamp(base + jitter, self.usage_start, self.usage_end)
+        # 缓慢增长：前慢后稍快的平滑曲线，避免线性太“假”
+        # ease-in-out 近似: 3t^2 - 2t^3
+        eased = t * t * (3.0 - 2.0 * t)
+        base = lerp(self.usage_start, self.usage_end, eased)
+        jitter = (self._r() - 0.5) * 0.02  # ±1%
+        lo = min(self.usage_start, self.usage_end)
+        hi = max(self.usage_start, self.usage_end)
+        return clamp(base + jitter, lo, hi)
 
     def snapshot(self, dt):
         c = self.cycle_for(dt)
@@ -212,23 +219,24 @@ class ResourceState(object):
         for i in range(n):
             jitter = (rng("%s-%s-M%d" % (self.seed, kind, cycle["index"]),
                           i * 17 + dt.toordinal()) - 0.5) * 0.08
-            ratios.append(clamp(avg_ratio + jitter, self.usage_start, self.usage_end))
+            ratios.append(clamp(avg_ratio + jitter, 0.0, max(self.usage_start, self.usage_end)))
         raw = [each * r for r in ratios]
         raw_sum = sum(raw) or 1.0
         scale = total_used / raw_sum
         pkgs = []
         allocated = 0.0
-        lo = each * self.usage_start
-        hi = each * self.usage_end
+        # 允许月初接近 0；月末落在 usage_end 附近
+        lo = max(0.0, each * min(self.usage_start, self.usage_end) - each * 0.01)
+        hi = each * max(self.usage_start, self.usage_end)
         # 控制台口径：生效=订购时间，到期=自动续订最终到期 2026-04-04
         active = self.order_start.strftime("%Y-%m-%d %H:%M:%S")
         expire = self.final_expire.strftime("%Y-%m-%d %H:%M:%S")
         for i in range(n):
             if i == n - 1:
                 used = clamp(total_used - allocated, 0.0, each)
-                used = clamp(used, lo, hi) if lo <= hi else used
+                used = clamp(used, lo, hi) if total_used > 0 else 0.0
             else:
-                used = clamp(raw[i] * scale, lo, hi)
+                used = clamp(raw[i] * scale, lo, hi) if total_used > 0 else 0.0
             allocated += used
             pkgs.append({
                 "id": i + 1,
@@ -243,6 +251,13 @@ class ResourceState(object):
                 "validity": "1个月(自动续订)",
                 "auto_renew": "是" if cycle["auto_renew"] else "否(末期)",
             })
+        # 月初总量接近 0 时不再二次校准拉高
+        if total_used <= 0.01:
+            for p in pkgs:
+                p["used"] = 0.0
+                p["remain"] = each
+                p["ratio"] = 0.0
+            return pkgs
         drift = total_used - sum(p["used"] for p in pkgs)
         if pkgs and abs(drift) > 0.01:
             for p in reversed(pkgs):
@@ -321,8 +336,12 @@ class LogBuilder(object):
             fmt_tb(PKG_TRAFFIC_MONTH_GB)))
         self.emit(dt, "CURRENT_CYCLE %s active=%s expire=%s" % (
             c["label"], ts(c["start"]), ts(c["end"])))
-        self.emit(dt, "USAGE_POLICY monthly_target_ratio=%.0f%%~%.0f%% (current~%.1f%%)" % (
-            self.state.usage_start * 100, self.state.usage_end * 100, snap["ratio"] * 100))
+        self.emit(dt, "USAGE_POLICY monthly_reset_on=每月4号新账期从0开始; "
+                   "grow_to=%.0f%%~%.0f%% (current~%.1f%%)" % (
+            max(self.state.usage_start, 0) * 100,
+            self.state.usage_end * 100,
+            snap["ratio"] * 100))
+        self.emit(dt, "USAGE_POLICY note=每个计费周期独立累计使用量，跨月不结转")
 
     def emit_package_report(self, dt, tag="RESOURCE"):
         snap = self.state.snapshot(dt)
@@ -512,6 +531,9 @@ class LogBuilder(object):
                                "final_expire=%s" % (
                                    prev["label"], c["label"], ts(c["start"]), ts(c["end"]),
                                    ts(self.final_expire)))
+                self.emit(cur, "USAGE_RESET cycle=%s reason=新计费周期开始(每月4号) "
+                               "calls_used=0 cap_used=0 traffic_used=0 "
+                               "note=使用量从0重新累计" % c["label"])
                 self.emit_package_report(cur, tag="RENEW")
                 last_cycle = c["index"]
 
@@ -585,10 +607,10 @@ def main():
     p.add_argument("--threads", type=int, default=64, help="模拟线程数")
     p.add_argument("--seed", default="yunchenkejieos001-20260104",
                    help="随机种子，相同可复现")
-    p.add_argument("--usage-start", type=float, default=0.60,
-                   help="当月期初使用率，默认 0.60")
-    p.add_argument("--usage-end", type=float, default=0.80,
-                   help="当月期末使用率，默认 0.80")
+    p.add_argument("--usage-start", type=float, default=0.0,
+                   help="当月期初使用率，默认 0（每月4号重置从0开始）")
+    p.add_argument("--usage-end", type=float, default=0.75,
+                   help="当月期末使用率，默认 0.75（落在60%%~80%%）")
     p.add_argument("--sample-minutes", type=int, default=180,
                    help="采样间隔分钟，默认 180")
     p.add_argument("--verbose-ratio", type=float, default=0.15,
