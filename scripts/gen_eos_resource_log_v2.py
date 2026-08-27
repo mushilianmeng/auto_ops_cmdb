@@ -380,11 +380,24 @@ class LogBuilder(object):
         snap = self.inv.snapshot(dt)
         c = snap["cycle"]
         clabel = c["label"] if c else "NONE"
-        self.emit(dt, "----- %s SNAPSHOT cycle=%s active_pkgs=%d paused_pkgs=%d -----" % (
+        t = dt
+
+        def tick(lo=0.3, hi=1.4):
+            # 闭包改外层 t
+            pass
+
+        # 用列表承载可变时间，便于逐行微调
+        cursor = [dt]
+
+        def emit_at(msg):
+            cursor[0] = cursor[0] + timedelta(milliseconds=180 + int(self.r() * 900))
+            self.emit(cursor[0], msg)
+
+        emit_at("----- %s SNAPSHOT cycle=%s active_pkgs=%d paused_pkgs=%d -----" % (
             tag, clabel, snap["active_count"], snap["paused_count"]))
 
         calls = snap["calls"]
-        self.emit(dt,
+        emit_at(
             "%s CALL_PKG scope=active_sum total=%s万次 used=%s万次 remain=%s万次 "
             "usage=%.2f%% packages=%d" % (
                 tag, fmt_num(calls["total"]), fmt_num(calls["used"]),
@@ -392,7 +405,7 @@ class LogBuilder(object):
         for it in calls["items"]:
             p = it["pkg"]
             exp = p["unsubscribe"] or p["planned_expire"]
-            self.emit(dt,
+            emit_at(
                 "%s CALL_PKG#%d order_no=%s resource_id=%s spec=%s万次 "
                 "used=%s万次 remain=%s万次 usage=%.2f%% active=%s expire=%s status=%s" % (
                     tag, p["idx"], p["order_no"], p["resource_id"],
@@ -403,7 +416,7 @@ class LogBuilder(object):
                 ))
 
         cap = snap["capacity"]
-        self.emit(dt,
+        emit_at(
             "%s CAP_PKG scope=active_sum total=%sGB(%sTB/%sPB) used=%sGB(%sTB) "
             "remain=%sGB usage=%.2f%% packages=%d" % (
                 tag, fmt_num(cap["total"]), fmt_tb(cap["total"]), fmt_pb(cap["total"]),
@@ -412,7 +425,7 @@ class LogBuilder(object):
         for it in cap["items"]:
             p = it["pkg"]
             exp = p["unsubscribe"] or p["planned_expire"]
-            self.emit(dt,
+            emit_at(
                 "%s CAP_PKG#%d order_no=%s resource_id=%s spec=%sGB "
                 "used=%sGB remain=%sGB usage=%.2f%% active=%s expire=%s status=%s" % (
                     tag, p["idx"], p["order_no"], p["resource_id"],
@@ -423,7 +436,7 @@ class LogBuilder(object):
                 ))
 
         traf = snap["traffic"]
-        self.emit(dt,
+        emit_at(
             "%s TRAFFIC_PKG scope=active_sum total=%sGB(%sTB) used=%sGB(%sTB) "
             "remain=%sGB usage=%.2f%% packages=%d" % (
                 tag, fmt_num(traf["total"]), fmt_tb(traf["total"]),
@@ -432,7 +445,7 @@ class LogBuilder(object):
         for it in traf["items"]:
             p = it["pkg"]
             exp = p["unsubscribe"] or p["planned_expire"]
-            self.emit(dt,
+            emit_at(
                 "%s TRAFFIC_PKG#%d order_no=%s resource_id=%s "
                 "cfg=对象存储下行流量包(GB):%s "
                 "used=%sGB remain=%sGB usage=%.2f%% active=%s expire=%s status=%s" % (
@@ -444,7 +457,7 @@ class LogBuilder(object):
                     self.inv.status_at(p, dt),
                 ))
 
-        self.emit(dt,
+        emit_at(
             "%s SUMMARY cycle=%s calls_used=%s/%s万次 cap_used=%s/%sGB "
             "traffic_used=%s/%sGB overall~%.1f%%" % (
                 tag, clabel,
@@ -457,19 +470,33 @@ class LogBuilder(object):
         return snap
 
     def emit_ops(self, dt):
-        burst = 6 + int(self.r() * 14)
+        """在 dt 附近打散一批操作日志，时间带分秒，避免整点对齐。"""
+        # 起点再抖一次，避免落在 :00:00
+        t = dt + timedelta(seconds=int(self.r() * 50) + 3,
+                           milliseconds=int(self.r() * 900))
+        burst = 12 + int(self.r() * 28)
         for _ in range(burst):
+            # 每条间隔 0.2s ~ 4.5s，偶尔跳几秒
+            gap = 0.2 + self.r() * 2.8
+            if self.r() < 0.12:
+                gap += 2.0 + self.r() * 8.0
+            t = t + timedelta(seconds=gap)
             self.calls_ops += 1
             if self.r() < self.verbose_ratio:
                 wid = 1 + int(self.r() * 32)
                 op = ("PUT", "GET", "HEAD", "DELETE", "LIST")[int(self.r() * 5)]
-                self.emit(dt, "[thread-%02d] %s ok bucket=%s endpoint=%s" % (
-                    wid, op, BUCKET, ENDPOINT))
-            if self.r() < 0.01:
+                latency = 8 + int(self.r() * 120)
+                self.emit(t, "[thread-%02d] %s ok bucket=%s endpoint=%s latency=%dms" % (
+                    wid, op, BUCKET, ENDPOINT, latency))
+            if self.r() < 0.012:
                 self.errors += 1
-                self.emit(dt, "WARN soft-throttle endpoint=%s http=429" % ENDPOINT)
-        snap = self.inv.snapshot(dt)
-        self.emit(dt,
+                t = t + timedelta(milliseconds=80 + int(self.r() * 400))
+                self.emit(t, "WARN soft-throttle endpoint=%s http=429 retry=1" % ENDPOINT)
+
+        # QUOTA / STAT 紧跟在一批操作后，也带分秒
+        t = t + timedelta(seconds=0.5 + self.r() * 2.5)
+        snap = self.inv.snapshot(t)
+        self.emit(t,
             "QUOTA cycle=%s calls_total=%s万次 calls_used=%s万次 | "
             "cap_total=%sGB cap_used=%sGB | "
             "traffic_total=%sGB traffic_used=%sGB | usage~%.1f%%" % (
@@ -481,8 +508,10 @@ class LogBuilder(object):
                   snap["traffic"]["ratio"]) / 3.0) * 100
                 if snap["active_count"] else 0.0,
             ))
-        self.emit(dt, "STAT ops=%d errors=%d active_pkgs=%d" % (
+        t = t + timedelta(milliseconds=200 + int(self.r() * 800))
+        self.emit(t, "STAT ops=%d errors=%d active_pkgs=%d" % (
             self.calls_ops, self.errors, snap["active_count"]))
+        return t
 
     def collect_events(self):
         events = []
@@ -555,14 +584,17 @@ class LogBuilder(object):
         events = [(t, k, p) for (t, k, p) in self.collect_events()
                   if self.start <= t <= self.end]
         ei = 0
-        cur = self.start
-        sample = timedelta(minutes=self.sample_minutes)
+        # 起点避开整点
+        cur = self.start + timedelta(
+            minutes=int(self.r() * 17) + 1,
+            seconds=int(self.r() * 50) + 5,
+        )
         last_cycle = None
         day_i = 0
 
-        # 若起点早于首单，先说明
         if cur < self.anchor:
-            self.emit(cur, "INFO waiting first order anchor=%s" % ts(self.anchor))
+            self.emit(self.start + timedelta(seconds=12 + int(self.r() * 40)),
+                      "INFO waiting first order anchor=%s" % ts(self.anchor))
 
         while cur <= self.end:
             while ei < len(events) and events[ei][0] <= cur:
@@ -577,18 +609,30 @@ class LogBuilder(object):
                 last_cycle = c["index"]
 
             if cur >= self.anchor:
-                self.emit_ops(cur)
+                last_t = self.emit_ops(cur)
                 day_i += 1
-                if day_i % 6 == 0:
-                    self.emit_quota(cur, tag="RESOURCE")
+                if day_i % 5 == 0:
+                    snap_t = last_t + timedelta(seconds=1 + int(self.r() * 7))
+                    self.emit_quota(snap_t, tag="RESOURCE")
+                    cur = snap_t
+                else:
+                    cur = last_t
 
-            cur += sample
+            # 下一批：采样间隔抖动 + 随机秒，打破整点节奏
+            jitter_min = (self.r() - 0.5) * self.sample_minutes * 0.55
+            step = max(25.0, self.sample_minutes + jitter_min)
+            cur = cur + timedelta(
+                minutes=step,
+                seconds=int(self.r() * 59) + 1,
+            )
 
-        # flush remaining events
         while ei < len(events):
             t, k, p = events[ei]
             self.emit_event(t, k, p)
             ei += 1
+
+        # 按时间排序，保证交错事件有序
+        self.lines.sort(key=lambda line: (line[:19], line))
 
         final = self.emit_quota(self.end, tag="FINAL")
         self.emit(self.end, "========== EOS resource usage log v2 end ==========")
@@ -613,11 +657,13 @@ def main():
     p.add_argument("--start", default="20260601")
     p.add_argument("--end", default="20260826")
     p.add_argument("-o", "--output", default="-")
-    p.add_argument("--sample-minutes", type=int, default=360)
+    p.add_argument("--sample-minutes", type=int, default=150,
+                   help="采样间隔基准分钟(会抖动)，默认150")
     p.add_argument("--usage-start", type=float, default=0.0)
     p.add_argument("--usage-end", type=float, default=0.75)
     p.add_argument("--seed", default="eos-20260601-20260826")
-    p.add_argument("--verbose-ratio", type=float, default=0.08)
+    p.add_argument("--verbose-ratio", type=float, default=0.18,
+                   help="详细请求日志比例 0~1，默认0.18")
     args = p.parse_args()
 
     pkgs = load_packages(args.data)
