@@ -75,6 +75,13 @@ def ts(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def ts_field(dt):
+    """字段内时间戳，避免空格导致换行后被当成新日志行。"""
+    if dt is None:
+        return "无"
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def rng(seed, i):
     h = hashlib.md5(("%s:%d" % (seed, i)).encode("utf-8")).hexdigest()
     return int(h[:8], 16) / 4294967295.0
@@ -228,9 +235,23 @@ class Inventory(object):
     def is_paused(self, p, dt):
         if not p["pause"]:
             return False
+        if p["unsubscribe"] is not None and dt >= p["unsubscribe"]:
+            return False
+        if p["order_time"] and dt < p["order_time"]:
+            return False
         if p["resume"]:
             return p["pause"] <= dt < p["resume"]
         return dt >= p["pause"]
+
+    def status_at(self, p, dt):
+        """按日志时间点计算状态（表格是「今天」快照，不能直接用最终 status）。"""
+        if p["order_time"] is None or dt < p["order_time"]:
+            return "未订购"
+        if p["unsubscribe"] is not None and dt >= p["unsubscribe"]:
+            return "已退订"
+        if self.is_paused(p, dt):
+            return "已暂停"
+        return "使用中"
 
     def package_ratio(self, p, dt):
         """单包使用率：从订购/当月账期起点从 0 增长到 usage_end。"""
@@ -328,21 +349,31 @@ class LogBuilder(object):
             self.inv.usage_start * 100, self.inv.usage_end * 100))
         for c in self.cycles:
             self.emit(dt, "BILLING_CYCLE %s active=%s expire=%s" % (
-                c["label"], ts(c["start"]), ts(c["end"])))
-        # 包清单摘要
+                c["label"], ts_field(c["start"]), ts_field(c["end"])))
+        self.emit(dt, "PKG_CATALOG note=以下仅列出截至当前日志时间已订购的资源包; status按当时状态计算")
+        # 包清单：按「当前日志时间」状态；未订购的不输出（避免 06-01 就显示已退订）
         for p in self.pkgs:
+            st = self.inv.status_at(p, dt)
+            if st == "未订购":
+                continue
             expire = p["unsubscribe"] or p["planned_expire"]
             self.emit(dt,
                 "PKG_CATALOG #%d kind=%s order_no=%s resource_id=%s amount=%s "
-                "order_time=%s pause=%s resume=%s unsub_or_expire=%s status=%s" % (
+                "order_time=%s pause=%s resume=%s unsub_or_expire=%s status=%s "
+                "status_as_of=%s final_status_in_sheet=%s" % (
                     p["idx"], p["kind"], p["order_no"], p["resource_id"],
                     fmt_num(p["amount"]),
-                    ts(p["order_time"]) if p["order_time"] else "-",
-                    ts(p["pause"]) if p["pause"] else "无",
-                    ts(p["resume"]) if p["resume"] else "无",
-                    ts(expire) if expire else "-",
+                    ts_field(p["order_time"]),
+                    ts_field(p["pause"]) if p["pause"] else "无",
+                    ts_field(p["resume"]) if p["resume"] else "无",
+                    ts_field(expire) if expire else "-",
+                    st,
+                    ts_field(dt),
                     p["status_raw"],
                 ))
+        pending = sum(1 for p in self.pkgs if self.inv.status_at(p, dt) == "未订购")
+        if pending:
+            self.emit(dt, "PKG_CATALOG pending_not_ordered_yet=%d (will appear on ORDER_EVENT)" % pending)
 
     def emit_quota(self, dt, tag="RESOURCE"):
         snap = self.inv.snapshot(dt)
@@ -366,8 +397,8 @@ class LogBuilder(object):
                     tag, p["idx"], p["order_no"], p["resource_id"],
                     fmt_num(p["amount"]), fmt_num(it["used"]), fmt_num(it["remain"]),
                     it["ratio"] * 100,
-                    ts(p["order_time"]), ts(exp) if exp else "-",
-                    p["status_raw"],
+                    ts_field(p["order_time"]), ts_field(exp) if exp else "-",
+                    self.inv.status_at(p, dt),
                 ))
 
         cap = snap["capacity"]
@@ -386,8 +417,8 @@ class LogBuilder(object):
                     tag, p["idx"], p["order_no"], p["resource_id"],
                     fmt_num(p["amount"]), fmt_num(it["used"]), fmt_num(it["remain"]),
                     it["ratio"] * 100,
-                    ts(p["order_time"]), ts(exp) if exp else "-",
-                    p["status_raw"],
+                    ts_field(p["order_time"]), ts_field(exp) if exp else "-",
+                    self.inv.status_at(p, dt),
                 ))
 
         traf = snap["traffic"]
@@ -408,8 +439,8 @@ class LogBuilder(object):
                     fmt_num(p["amount"]),
                     fmt_num(it["used"]), fmt_num(it["remain"]),
                     it["ratio"] * 100,
-                    ts(p["order_time"]), ts(exp) if exp else "-",
-                    p["status_raw"],
+                    ts_field(p["order_time"]), ts_field(exp) if exp else "-",
+                    self.inv.status_at(p, dt),
                 ))
 
         self.emit(dt,
@@ -484,18 +515,36 @@ class LogBuilder(object):
                 "name=%s status=开通成功" % (
                     p["kind"], p["order_no"], p["resource_id"],
                     fmt_num(p["amount"]), p["name"]))
+            expire = p["unsubscribe"] or p["planned_expire"]
+            self.emit(dt,
+                "PKG_CATALOG #%d kind=%s order_no=%s resource_id=%s amount=%s "
+                "order_time=%s pause=%s resume=%s unsub_or_expire=%s status=%s "
+                "status_as_of=%s final_status_in_sheet=%s" % (
+                    p["idx"], p["kind"], p["order_no"], p["resource_id"],
+                    fmt_num(p["amount"]),
+                    ts_field(p["order_time"]),
+                    ts_field(p["pause"]) if p["pause"] else "无",
+                    ts_field(p["resume"]) if p["resume"] else "无",
+                    ts_field(expire) if expire else "-",
+                    self.inv.status_at(p, dt),
+                    ts_field(dt),
+                    p["status_raw"],
+                ))
         elif kind == "PAUSE":
             self.emit(dt,
-                "PAUSE_EVENT kind=%s order_no=%s resource_id=%s at=%s" % (
-                    p["kind"], p["order_no"], p["resource_id"], ts(dt)))
+                "PAUSE_EVENT kind=%s order_no=%s resource_id=%s at=%s status=%s" % (
+                    p["kind"], p["order_no"], p["resource_id"], ts_field(dt),
+                    self.inv.status_at(p, dt)))
         elif kind == "RESUME":
             self.emit(dt,
-                "RESUME_EVENT kind=%s order_no=%s resource_id=%s at=%s" % (
-                    p["kind"], p["order_no"], p["resource_id"], ts(dt)))
+                "RESUME_EVENT kind=%s order_no=%s resource_id=%s at=%s status=%s" % (
+                    p["kind"], p["order_no"], p["resource_id"], ts_field(dt),
+                    self.inv.status_at(p, dt)))
         elif kind == "UNSUBSCRIBE":
             self.emit(dt,
-                "UNSUBSCRIBE_EVENT kind=%s order_no=%s resource_id=%s at=%s status=已退订" % (
-                    p["kind"], p["order_no"], p["resource_id"], ts(dt)))
+                "UNSUBSCRIBE_EVENT kind=%s order_no=%s resource_id=%s at=%s status=%s" % (
+                    p["kind"], p["order_no"], p["resource_id"], ts_field(dt),
+                    self.inv.status_at(p, dt)))
 
     def build(self):
         self.write_banner(self.start)
