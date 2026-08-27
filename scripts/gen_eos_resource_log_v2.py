@@ -518,21 +518,20 @@ class LogBuilder(object):
                     fmt_num(p["amount"]), p["name"]))
             expire = p["unsubscribe"] or p["planned_expire"]
             st = self.inv.status_at(p, dt)
-            if st is None:
-                continue
-            self.emit(dt,
-                "PKG_CATALOG #%d kind=%s order_no=%s resource_id=%s amount=%s "
-                "order_time=%s pause=%s resume=%s unsub_or_expire=%s status=%s "
-                "status_as_of=%s" % (
-                    p["idx"], p["kind"], p["order_no"], p["resource_id"],
-                    fmt_num(p["amount"]),
-                    ts_field(p["order_time"]),
-                    ts_field(p["pause"]) if p["pause"] else "无",
-                    ts_field(p["resume"]) if p["resume"] else "无",
-                    ts_field(expire) if expire else "-",
-                    st,
-                    ts_field(dt),
-                ))
+            if st is not None:
+                self.emit(dt,
+                    "PKG_CATALOG #%d kind=%s order_no=%s resource_id=%s amount=%s "
+                    "order_time=%s pause=%s resume=%s unsub_or_expire=%s status=%s "
+                    "status_as_of=%s" % (
+                        p["idx"], p["kind"], p["order_no"], p["resource_id"],
+                        fmt_num(p["amount"]),
+                        ts_field(p["order_time"]),
+                        ts_field(p["pause"]) if p["pause"] else "无",
+                        ts_field(p["resume"]) if p["resume"] else "无",
+                        ts_field(expire) if expire else "-",
+                        st,
+                        ts_field(dt),
+                    ))
         elif kind == "PAUSE":
             st = self.inv.status_at(p, dt)
             self.emit(dt,
