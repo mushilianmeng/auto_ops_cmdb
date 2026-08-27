@@ -244,11 +244,13 @@ class Inventory(object):
         return dt >= p["pause"]
 
     def status_at(self, p, dt):
-        """按日志时间点计算状态（表格是「今天」快照，不能直接用最终 status）。"""
+        """按日志时间点计算状态（表格是「今天」快照，不能直接用最终 status）。
+        注意：不返回「已退订」——退订后的包不再展示 status，或直接不输出。
+        """
         if p["order_time"] is None or dt < p["order_time"]:
             return "未订购"
         if p["unsubscribe"] is not None and dt >= p["unsubscribe"]:
-            return "已退订"
+            return None  # 已退订：调用方应跳过展示，不输出该字样
         if self.is_paused(p, dt):
             return "已暂停"
         return "使用中"
@@ -350,17 +352,17 @@ class LogBuilder(object):
         for c in self.cycles:
             self.emit(dt, "BILLING_CYCLE %s active=%s expire=%s" % (
                 c["label"], ts_field(c["start"]), ts_field(c["end"])))
-        self.emit(dt, "PKG_CATALOG note=以下仅列出截至当前日志时间已订购的资源包; status按当时状态计算")
-        # 包清单：按「当前日志时间」状态；未订购的不输出（避免 06-01 就显示已退订）
+        self.emit(dt, "PKG_CATALOG note=以下仅列出截至当前日志时间已订购且未退订的资源包; status按当时状态计算")
+        # 包清单：按「当前日志时间」状态；未订购/已退订的不输出
         for p in self.pkgs:
             st = self.inv.status_at(p, dt)
-            if st == "未订购":
+            if st in (None, "未订购"):
                 continue
             expire = p["unsubscribe"] or p["planned_expire"]
             self.emit(dt,
                 "PKG_CATALOG #%d kind=%s order_no=%s resource_id=%s amount=%s "
                 "order_time=%s pause=%s resume=%s unsub_or_expire=%s status=%s "
-                "status_as_of=%s final_status_in_sheet=%s" % (
+                "status_as_of=%s" % (
                     p["idx"], p["kind"], p["order_no"], p["resource_id"],
                     fmt_num(p["amount"]),
                     ts_field(p["order_time"]),
@@ -369,7 +371,6 @@ class LogBuilder(object):
                     ts_field(expire) if expire else "-",
                     st,
                     ts_field(dt),
-                    p["status_raw"],
                 ))
         pending = sum(1 for p in self.pkgs if self.inv.status_at(p, dt) == "未订购")
         if pending:
@@ -516,35 +517,39 @@ class LogBuilder(object):
                     p["kind"], p["order_no"], p["resource_id"],
                     fmt_num(p["amount"]), p["name"]))
             expire = p["unsubscribe"] or p["planned_expire"]
+            st = self.inv.status_at(p, dt)
+            if st is None:
+                continue
             self.emit(dt,
                 "PKG_CATALOG #%d kind=%s order_no=%s resource_id=%s amount=%s "
                 "order_time=%s pause=%s resume=%s unsub_or_expire=%s status=%s "
-                "status_as_of=%s final_status_in_sheet=%s" % (
+                "status_as_of=%s" % (
                     p["idx"], p["kind"], p["order_no"], p["resource_id"],
                     fmt_num(p["amount"]),
                     ts_field(p["order_time"]),
                     ts_field(p["pause"]) if p["pause"] else "无",
                     ts_field(p["resume"]) if p["resume"] else "无",
                     ts_field(expire) if expire else "-",
-                    self.inv.status_at(p, dt),
+                    st,
                     ts_field(dt),
-                    p["status_raw"],
                 ))
         elif kind == "PAUSE":
+            st = self.inv.status_at(p, dt)
             self.emit(dt,
-                "PAUSE_EVENT kind=%s order_no=%s resource_id=%s at=%s status=%s" % (
+                "PAUSE_EVENT kind=%s order_no=%s resource_id=%s at=%s%s" % (
                     p["kind"], p["order_no"], p["resource_id"], ts_field(dt),
-                    self.inv.status_at(p, dt)))
+                    (" status=%s" % st) if st else ""))
         elif kind == "RESUME":
+            st = self.inv.status_at(p, dt)
             self.emit(dt,
-                "RESUME_EVENT kind=%s order_no=%s resource_id=%s at=%s status=%s" % (
+                "RESUME_EVENT kind=%s order_no=%s resource_id=%s at=%s%s" % (
                     p["kind"], p["order_no"], p["resource_id"], ts_field(dt),
-                    self.inv.status_at(p, dt)))
+                    (" status=%s" % st) if st else ""))
         elif kind == "UNSUBSCRIBE":
+            # 不输出 status=已退订
             self.emit(dt,
-                "UNSUBSCRIBE_EVENT kind=%s order_no=%s resource_id=%s at=%s status=%s" % (
-                    p["kind"], p["order_no"], p["resource_id"], ts_field(dt),
-                    self.inv.status_at(p, dt)))
+                "UNSUBSCRIBE_EVENT kind=%s order_no=%s resource_id=%s at=%s" % (
+                    p["kind"], p["order_no"], p["resource_id"], ts_field(dt)))
 
     def build(self):
         self.write_banner(self.start)
